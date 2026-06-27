@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 description = "A minimalist, snappy, modeless terminal code editor"
 license = "MIT"
-repository = "https://github.com/guilhermemartim/NyxVim"
+repository = "https://github.com/Guiartuzo/NyxVim"
 
 [dependencies]
 crossterm = "0.29.0"
