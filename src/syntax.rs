@@ -96,10 +96,10 @@ impl Syntax {
                     stack.pop();
                 }
                 Ok(HighlightEvent::Source { start, end }) => {
-                    if let Some(&idx) = stack.last() {
-                        if start < end {
-                            spans.push((start, end, self.styles[idx]));
-                        }
+                    if let Some(&idx) = stack.last()
+                        && start < end
+                    {
+                        spans.push((start, end, self.styles[idx]));
                     }
                 }
                 Err(_) => break,

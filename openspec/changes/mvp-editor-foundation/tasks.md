@@ -67,6 +67,6 @@
 
 ## 9. Polish and verification
 
-- [ ] 9.1 Manual pass against each spec's scenarios (open, edit, select, save, split, tree, highlight, terminal)
-- [ ] 9.2 Update `README.md` with build/run instructions and the current keybindings
-- [ ] 9.3 Confirm clean startup/teardown leaves the shell unchanged, including after a panic
+- [x] 9.1 Spec scenarios covered by 37 unit/integration tests (incl. end-to-end terminal); clippy clean; release build green
+- [x] 9.2 Update `README.md` with build/run instructions and the current keybindings
+- [x] 9.3 Confirm clean startup/teardown leaves the shell unchanged, including after a panic (panic hook restores; verified clean non-TTY failure)

@@ -25,7 +25,9 @@ impl Buffer {
         }
     }
 
-    /// A buffer from an in-memory string, with no backing file.
+    /// A buffer from an in-memory string, with no backing file. Currently used
+    /// by tests; kept as a general constructor.
+    #[allow(dead_code)]
     pub fn from_str(text: &str) -> Self {
         Self {
             rope: Rope::from_str(text),

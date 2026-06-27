@@ -85,6 +85,7 @@ impl FileTree {
         out
     }
 
+    #[allow(dead_code)] // public query, exercised by tests
     pub fn selected_path(&self) -> Option<PathBuf> {
         self.visible().get(self.selected).map(|n| n.path.clone())
     }
@@ -101,19 +102,21 @@ impl FileTree {
     }
 
     pub fn expand_selected(&mut self) {
-        if let Some(node) = self.nth_visible_mut(self.selected) {
-            if node.is_dir && !node.expanded {
-                node.expanded = true;
-                load_if_needed(node);
-            }
+        if let Some(node) = self.nth_visible_mut(self.selected)
+            && node.is_dir
+            && !node.expanded
+        {
+            node.expanded = true;
+            load_if_needed(node);
         }
     }
 
     pub fn collapse_selected(&mut self) {
-        if let Some(node) = self.nth_visible_mut(self.selected) {
-            if node.is_dir && node.expanded {
-                node.expanded = false;
-            }
+        if let Some(node) = self.nth_visible_mut(self.selected)
+            && node.is_dir
+            && node.expanded
+        {
+            node.expanded = false;
         }
         self.clamp_selection();
     }
@@ -196,11 +199,12 @@ impl FileTree {
 
 fn collect_visible<'a>(node: &'a Node, out: &mut Vec<&'a Node>) {
     out.push(node);
-    if node.is_dir && node.expanded {
-        if let Some(children) = &node.children {
-            for child in children {
-                collect_visible(child, out);
-            }
+    if node.is_dir
+        && node.expanded
+        && let Some(children) = &node.children
+    {
+        for child in children {
+            collect_visible(child, out);
         }
     }
 }
@@ -214,12 +218,13 @@ fn nth_visible_in<'a>(
         return Some(node);
     }
     *counter += 1;
-    if node.is_dir && node.expanded {
-        if let Some(children) = node.children.as_mut() {
-            for child in children.iter_mut() {
-                if let Some(found) = nth_visible_in(child, counter, target) {
-                    return Some(found);
-                }
+    if node.is_dir
+        && node.expanded
+        && let Some(children) = node.children.as_mut()
+    {
+        for child in children.iter_mut() {
+            if let Some(found) = nth_visible_in(child, counter, target) {
+                return Some(found);
             }
         }
     }

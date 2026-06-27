@@ -260,8 +260,9 @@ impl EditorPane {
             .map(|p| p.display().to_string())
             .unwrap_or_else(|| "[No Name]".to_string());
         let dirty = if buffer.is_dirty() { " [+]" } else { "" };
+        let selection = if self.has_selection() { "  SEL" } else { "" };
         let text = format!(
-            " {name}{dirty}    Ln {}, Col {} ",
+            " {name}{dirty}{selection}    Ln {}, Col {} ",
             self.cursor.line + 1,
             self.cursor.col + 1
         );

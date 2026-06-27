@@ -43,10 +43,11 @@ enum Focus {
 }
 
 /// A pane in the editor area: a text editor or an integrated terminal.
+/// The terminal is boxed because it is much larger than an editor pane.
 #[derive(Debug)]
 enum Pane {
     Editor(EditorPane),
-    Terminal(TerminalPane),
+    Terminal(Box<TerminalPane>),
 }
 
 /// Central application state — the single owner of everything NyxVim tracks.
@@ -263,7 +264,8 @@ impl App {
         let id = self.next_terminal_id;
         if let Ok(term) = TerminalPane::spawn(id, tx) {
             self.next_terminal_id += 1;
-            self.panes.insert(self.focused + 1, Pane::Terminal(term));
+            self.panes
+                .insert(self.focused + 1, Pane::Terminal(Box::new(term)));
             self.focused += 1;
         }
     }
@@ -280,11 +282,11 @@ impl App {
     /// Deliver shell output to the matching terminal pane.
     fn feed_terminal(&mut self, id: usize, bytes: &[u8]) {
         for pane in &mut self.panes {
-            if let Pane::Terminal(term) = pane {
-                if term.id == id {
-                    term.process(bytes);
-                    return;
-                }
+            if let Pane::Terminal(term) = pane
+                && term.id == id
+            {
+                term.process(bytes);
+                return;
             }
         }
     }
