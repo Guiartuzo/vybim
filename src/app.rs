@@ -15,7 +15,10 @@ use std::thread;
 
 use ratatui::Frame;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use ratatui::layout::{Constraint, Layout};
+use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::style::{Color, Style};
+use ratatui::text::{Line, Text};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 
 use crate::buffer::Buffer;
 use crate::file_tree::FileTree;
@@ -26,6 +29,37 @@ use crate::terminal_pane::TerminalPane;
 
 /// Width of the file-tree sidebar, in columns.
 const SIDEBAR_WIDTH: u16 = 28;
+
+/// One keybinding, the single source of truth for both the footer hint and the
+/// help overlay (so they can't drift). `footer` holds a terse label when the
+/// binding should also appear in the bottom hint.
+struct KeyBinding {
+    group: &'static str,
+    keys: &'static str,
+    action: &'static str,
+    footer: Option<&'static str>,
+}
+
+/// All user-facing keybindings, grouped. The overlay renders every entry; the
+/// footer renders only those with a `footer` label.
+const BINDINGS: &[KeyBinding] = &[
+    KeyBinding { group: "Global", keys: "Ctrl+Q", action: "Quit", footer: Some("quit") },
+    KeyBinding { group: "Global", keys: "Ctrl+B", action: "Show / hide sidebar", footer: Some("sidebar") },
+    KeyBinding { group: "Global", keys: "F1", action: "Toggle this help", footer: Some("help") },
+    KeyBinding { group: "Editor", keys: "Arrows", action: "Move cursor", footer: None },
+    KeyBinding { group: "Editor", keys: "Shift+move", action: "Extend selection", footer: None },
+    KeyBinding { group: "Editor", keys: "Home / End", action: "Line start / end", footer: None },
+    KeyBinding { group: "Editor", keys: "PageUp / PageDown", action: "Move by a screenful", footer: None },
+    KeyBinding { group: "Editor", keys: "Ctrl+S", action: "Save", footer: Some("save") },
+    KeyBinding { group: "Editor", keys: "Ctrl+E", action: "Split pane vertically", footer: Some("split") },
+    KeyBinding { group: "Editor", keys: "Ctrl+\\", action: "Split pane (alias)", footer: None },
+    KeyBinding { group: "Editor", keys: "Ctrl+T", action: "Open terminal", footer: Some("term") },
+    KeyBinding { group: "Editor", keys: "Ctrl+W", action: "Close pane", footer: Some("close") },
+    KeyBinding { group: "Editor", keys: "Alt+Left / Alt+Right", action: "Move focus between panes", footer: None },
+    KeyBinding { group: "Sidebar", keys: "Up / Down", action: "Move selection", footer: None },
+    KeyBinding { group: "Sidebar", keys: "Left / Right", action: "Collapse / expand directory", footer: None },
+    KeyBinding { group: "Sidebar", keys: "Enter", action: "Open file / toggle directory", footer: None },
+];
 
 /// An event delivered to the main loop, from input or from a terminal pane.
 #[derive(Debug)]
@@ -69,6 +103,10 @@ pub struct App {
     event_tx: Option<Sender<AppEvent>>,
     /// Monotonic id source for terminal panes.
     next_terminal_id: usize,
+    /// Whether the keybinding help overlay is currently shown.
+    help_visible: bool,
+    /// Whether the file-tree sidebar is shown.
+    sidebar_visible: bool,
 }
 
 impl App {
@@ -85,6 +123,8 @@ impl App {
             focus: Focus::Editor,
             event_tx: None,
             next_terminal_id: 0,
+            help_visible: false,
+            sidebar_visible: true,
         }
     }
 
@@ -132,33 +172,79 @@ impl App {
     }
 
     fn render(&mut self, frame: &mut Frame) {
-        // Sidebar on the left, the pane area filling the rest.
-        let [sidebar, pane_area] =
-            Layout::horizontal([Constraint::Length(SIDEBAR_WIDTH), Constraint::Fill(1)])
-                .areas(frame.area());
+        // A one-row keybinding hint sits at the very bottom; everything else
+        // fills the body above it.
+        let [body, footer] =
+            Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(frame.area());
 
-        self.tree
-            .render(frame, sidebar, self.focus == Focus::Sidebar);
+        // Sidebar on the left when visible; otherwise the pane area fills the
+        // whole body.
+        let pane_area = if self.sidebar_visible {
+            let [sidebar, pane_area] =
+                Layout::horizontal([Constraint::Length(SIDEBAR_WIDTH), Constraint::Fill(1)])
+                    .areas(body);
+            self.tree
+                .render(frame, sidebar, self.focus == Focus::Sidebar);
+            pane_area
+        } else {
+            body
+        };
 
-        // Divide the pane area evenly across panes (vertical splits).
-        let constraints = vec![Constraint::Fill(1); self.panes.len()];
+        // Divide the pane area across panes, with a 1-column divider between
+        // adjacent panes. Pane i lives at regions[i*2]; its divider (if any) at
+        // regions[i*2 + 1].
+        let n = self.panes.len();
+        let mut constraints = Vec::with_capacity(n * 2);
+        for i in 0..n {
+            constraints.push(Constraint::Fill(1));
+            if i + 1 < n {
+                constraints.push(Constraint::Length(1));
+            }
+        }
         let regions = Layout::horizontal(constraints).split(pane_area);
         for (i, pane) in self.panes.iter_mut().enumerate() {
+            let region = regions[i * 2];
             let focused = self.focus == Focus::Editor && i == self.focused;
             match pane {
                 Pane::Editor(ed) => {
                     let buffer = &self.buffers[ed.buffer_id];
                     let syntax = self.syntaxes[ed.buffer_id].as_ref();
-                    ed.render(frame, regions[i], buffer, syntax, focused);
+                    ed.render(frame, region, buffer, syntax, focused);
                 }
-                Pane::Terminal(term) => term.render(frame, regions[i], focused),
+                Pane::Terminal(term) => term.render(frame, region, focused),
             }
+        }
+        // Thin vertical lines between panes.
+        for i in 0..n.saturating_sub(1) {
+            let divider = Block::new()
+                .borders(Borders::LEFT)
+                .border_style(Style::new().fg(Color::DarkGray));
+            frame.render_widget(divider, regions[i * 2 + 1]);
+        }
+
+        render_footer(frame, footer);
+
+        if self.help_visible {
+            render_help_overlay(frame);
         }
     }
 
     /// Handle a key press. Truly global chords (quit, toggle sidebar) are
     /// handled first; the rest are routed by which region has focus.
     fn on_key(&mut self, key: KeyEvent) {
+        // The help overlay is modal: F1 toggles it, and while it is open every
+        // other key is swallowed (Esc also closes) so nothing edits underneath.
+        if key.code == KeyCode::F(1) {
+            self.help_visible = !self.help_visible;
+            return;
+        }
+        if self.help_visible {
+            if key.code == KeyCode::Esc {
+                self.help_visible = false;
+            }
+            return;
+        }
+
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
 
         match key.code {
@@ -167,7 +253,7 @@ impl App {
                 return;
             }
             KeyCode::Char('b') if ctrl => {
-                self.toggle_sidebar_focus();
+                self.toggle_sidebar();
                 return;
             }
             _ => {}
@@ -202,6 +288,10 @@ impl App {
         let alt = key.modifiers.contains(KeyModifiers::ALT);
 
         match key.code {
+            // Primary split chord. `ctrl+e` is layout-independent and reachable
+            // (e.g. on ABNT, where `ctrl+\` is impractical); `ctrl+\` stays as
+            // a secondary alias.
+            KeyCode::Char('e') if ctrl => return self.split_vertical(),
             KeyCode::Char('\\') if ctrl => return self.split_vertical(),
             KeyCode::Char('t') if ctrl => return self.open_terminal(),
             KeyCode::Char('w') if ctrl => return self.close_focused_pane(),
@@ -221,10 +311,14 @@ impl App {
 
     // --- sidebar -----------------------------------------------------------
 
-    fn toggle_sidebar_focus(&mut self) {
-        self.focus = match self.focus {
-            Focus::Sidebar => Focus::Editor,
-            Focus::Editor => Focus::Sidebar,
+    /// Show or hide the sidebar, moving focus automatically: showing it focuses
+    /// the tree (ready to navigate); hiding it returns focus to the editor.
+    fn toggle_sidebar(&mut self) {
+        self.sidebar_visible = !self.sidebar_visible;
+        self.focus = if self.sidebar_visible {
+            Focus::Sidebar
+        } else {
+            Focus::Editor
         };
     }
 
@@ -319,6 +413,64 @@ impl App {
     }
 }
 
+/// Render the bottom keybinding hint so the core chords are discoverable. Built
+/// from [`BINDINGS`] so it can never drift from the help overlay.
+fn render_footer(frame: &mut Frame, area: Rect) {
+    let mut hint = String::new();
+    for b in BINDINGS {
+        if let Some(label) = b.footer {
+            hint.push_str(&format!("  {} {} ", compact_keys(b.keys), label));
+        }
+    }
+    let style = Style::new().bg(Color::DarkGray).fg(Color::White);
+    frame.render_widget(Paragraph::new(hint).style(style), area);
+}
+
+/// Compact a key string for the narrow footer (`Ctrl+Q` -> `^Q`).
+fn compact_keys(keys: &str) -> String {
+    keys.replace("Ctrl+", "^").replace("Alt+", "M-")
+}
+
+/// Draw the keybinding help overlay centered over the screen. Modal: the caller
+/// has already ensured input is swallowed while it is visible.
+fn render_help_overlay(frame: &mut Frame) {
+    let mut lines: Vec<Line> = Vec::new();
+    let mut group = "";
+    for b in BINDINGS {
+        if b.group != group {
+            if !group.is_empty() {
+                lines.push(Line::raw(""));
+            }
+            lines.push(Line::styled(b.group, Style::new().fg(Color::Yellow)));
+            group = b.group;
+        }
+        lines.push(Line::raw(format!("  {:<22} {}", b.keys, b.action)));
+    }
+    lines.push(Line::raw(""));
+    lines.push(Line::styled(
+        "  Esc or F1 to close",
+        Style::new().fg(Color::DarkGray),
+    ));
+
+    let height = lines.len() as u16 + 2; // + borders
+    let area = centered_rect(frame.area(), 52, height);
+    let block = Block::new()
+        .borders(Borders::ALL)
+        .border_style(Style::new().fg(Color::Blue))
+        .title(" NyxVim — Keybindings ");
+    frame.render_widget(Clear, area);
+    frame.render_widget(Paragraph::new(Text::from(lines)).block(block), area);
+}
+
+/// A `width`x`height` rectangle centered within `area`, clamped to fit.
+fn centered_rect(area: Rect, width: u16, height: u16) -> Rect {
+    let w = width.min(area.width);
+    let h = height.min(area.height);
+    let x = area.x + (area.width - w) / 2;
+    let y = area.y + (area.height - h) / 2;
+    Rect::new(x, y, w, h)
+}
+
 /// Route an editing/movement key to an editor pane and its buffer.
 fn dispatch_editor(ed: &mut EditorPane, buffer: &mut Buffer, key: KeyEvent) {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
@@ -333,6 +485,10 @@ fn dispatch_editor(ed: &mut EditorPane, buffer: &mut Buffer, key: KeyEvent) {
         KeyCode::Right => ed.move_right(buffer, extend),
         KeyCode::Up => ed.move_up(buffer, extend),
         KeyCode::Down => ed.move_down(buffer, extend),
+        KeyCode::Home => ed.move_line_start(buffer, extend),
+        KeyCode::End => ed.move_line_end(buffer, extend),
+        KeyCode::PageUp => ed.page_up(buffer, extend),
+        KeyCode::PageDown => ed.page_down(buffer, extend),
         KeyCode::Enter => ed.insert_newline(buffer),
         KeyCode::Backspace => ed.backspace(buffer),
         KeyCode::Delete => ed.delete_forward(buffer),
@@ -385,10 +541,17 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_b_toggles_sidebar_focus() {
+    fn ctrl_b_toggles_sidebar_visibility_and_focus() {
         let mut app = test_app();
+        assert!(app.sidebar_visible);
         assert_eq!(app.focus, Focus::Editor);
+        // hide: focus returns to the editor
         app.on_key(press(KeyCode::Char('b'), KeyModifiers::CONTROL));
+        assert!(!app.sidebar_visible);
+        assert_eq!(app.focus, Focus::Editor);
+        // show: focus moves to the tree, ready to navigate
+        app.on_key(press(KeyCode::Char('b'), KeyModifiers::CONTROL));
+        assert!(app.sidebar_visible);
         assert_eq!(app.focus, Focus::Sidebar);
         // while in the sidebar, plain chars do not edit the buffer
         app.on_key(press(KeyCode::Char('x'), KeyModifiers::NONE));
@@ -421,6 +584,38 @@ mod tests {
         assert_eq!(app.focused, 1);
         // both panes view the same buffer
         assert_eq!(buffer_id_at(&app, 0), buffer_id_at(&app, 1));
+    }
+
+    #[test]
+    fn f1_toggles_help_and_swallows_input_while_open() {
+        let mut app = test_app();
+        assert!(!app.help_visible);
+        app.on_key(press(KeyCode::F(1), KeyModifiers::NONE));
+        assert!(app.help_visible);
+        // while help is open, typing does not edit the buffer
+        app.on_key(press(KeyCode::Char('x'), KeyModifiers::NONE));
+        assert_eq!(app.buffers[0].line_text(0), "hello");
+        // Esc closes it
+        app.on_key(press(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(!app.help_visible);
+        // F1 again toggles back on
+        app.on_key(press(KeyCode::F(1), KeyModifiers::NONE));
+        assert!(app.help_visible);
+    }
+
+    #[test]
+    fn ctrl_e_splits_the_focused_pane() {
+        let mut app = test_app();
+        app.on_key(press(KeyCode::Char('e'), KeyModifiers::CONTROL));
+        assert_eq!(app.panes.len(), 2);
+        assert_eq!(app.focused, 1);
+    }
+
+    #[test]
+    fn ctrl_backslash_still_splits() {
+        let mut app = test_app();
+        app.on_key(press(KeyCode::Char('\\'), KeyModifiers::CONTROL));
+        assert_eq!(app.panes.len(), 2);
     }
 
     #[test]
