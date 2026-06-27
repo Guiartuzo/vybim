@@ -15,6 +15,14 @@ use ratatui::widgets::Paragraph;
 use crate::buffer::Buffer;
 use crate::syntax::Syntax;
 
+/// Background of the line the cursor is on (a subtle dark gray from the 256
+/// palette, so it reads on most terminals without truecolor).
+const CURRENT_LINE_BG: Color = Color::Indexed(236);
+
+/// Background of selected text — a blue from the 256 palette, distinct from the
+/// current-line tint so a selection clearly stands out.
+const SELECTION_BG: Color = Color::Indexed(24);
+
 /// Cursor position within the buffer. `target_col` remembers the column the
 /// user "wants" so vertical movement across short lines doesn't lose it.
 #[derive(Debug, Default, Clone, Copy)]
@@ -33,6 +41,9 @@ pub struct EditorPane {
     anchor: Option<(usize, usize)>,
     scroll_row: usize,
     scroll_col: usize,
+    /// Height of the content region at the last render, used by page movement
+    /// (which needs the viewport size, only known at render time).
+    last_height: usize,
 }
 
 impl EditorPane {
@@ -43,6 +54,7 @@ impl EditorPane {
             anchor: None,
             scroll_row: 0,
             scroll_col: 0,
+            last_height: 0,
         }
     }
 
@@ -138,6 +150,50 @@ impl EditorPane {
         }
     }
 
+    /// Move to column zero of the current line (Home).
+    pub fn move_line_start(&mut self, _buffer: &Buffer, extend: bool) {
+        self.pre_move(extend);
+        self.cursor.col = 0;
+        self.cursor.target_col = 0;
+    }
+
+    /// Move to the end of the current line (End).
+    pub fn move_line_end(&mut self, buffer: &Buffer, extend: bool) {
+        self.pre_move(extend);
+        self.cursor.col = self.line_len(buffer, self.cursor.line);
+        self.cursor.target_col = self.cursor.col;
+    }
+
+    /// Move up by roughly one viewport height (PageUp), keeping the target
+    /// column. Uses the height cached at the last render.
+    pub fn page_up(&mut self, buffer: &Buffer, extend: bool) {
+        self.pre_move(extend);
+        let page = self.page_rows();
+        self.cursor.line = self.cursor.line.saturating_sub(page);
+        self.cursor.col = self
+            .cursor
+            .target_col
+            .min(self.line_len(buffer, self.cursor.line));
+    }
+
+    /// Move down by roughly one viewport height (PageDown), keeping the target
+    /// column. Uses the height cached at the last render.
+    pub fn page_down(&mut self, buffer: &Buffer, extend: bool) {
+        self.pre_move(extend);
+        let page = self.page_rows();
+        self.cursor.line = (self.cursor.line + page).min(self.last_line(buffer));
+        self.cursor.col = self
+            .cursor
+            .target_col
+            .min(self.line_len(buffer, self.cursor.line));
+    }
+
+    /// Rows to jump for a page movement: the last-rendered content height, or a
+    /// sane default before the first render.
+    fn page_rows(&self) -> usize {
+        self.last_height.max(1)
+    }
+
     // --- editing -----------------------------------------------------------
 
     /// Delete the active selection, if any, moving the cursor to its start.
@@ -229,27 +285,92 @@ impl EditorPane {
         syntax: Option<&Syntax>,
         focused: bool,
     ) {
-        let height = area.height as usize;
-        let width = area.width as usize;
+        // Reserve a left gutter for line numbers; text fills the rest.
+        let num_w = gutter_num_width(buffer.line_count());
+        let gutter_w = (num_w + 1) as u16;
+        let [gutter, content] =
+            Layout::horizontal([Constraint::Length(gutter_w), Constraint::Min(0)]).areas(area);
+
+        let height = content.height as usize;
+        let width = content.width as usize;
+        self.last_height = height;
 
         self.scroll_row = scroll_to_show(self.scroll_row, self.cursor.line, height);
         self.scroll_col = scroll_to_show(self.scroll_col, self.cursor.col, width);
 
+        let mut numbers: Vec<Line> = Vec::with_capacity(height);
         let mut lines: Vec<Line> = Vec::with_capacity(height);
         for row in 0..height {
             let line_idx = self.scroll_row + row;
             if line_idx >= buffer.line_count() {
                 break;
             }
+            let is_current = line_idx == self.cursor.line;
+            let num_style = if is_current && focused {
+                Style::new().fg(Color::White)
+            } else {
+                Style::new().fg(Color::DarkGray)
+            };
+            numbers.push(Line::styled(
+                format!("{:>width$} ", line_idx + 1, width = num_w),
+                num_style,
+            ));
+
             let text = buffer.line_text(line_idx);
             let visible: String = text.chars().skip(self.scroll_col).collect();
             lines.push(highlight_line(&visible, syntax));
         }
-        frame.render_widget(Paragraph::new(Text::from(lines)), area);
+        frame.render_widget(Paragraph::new(Text::from(numbers)), gutter);
+        frame.render_widget(Paragraph::new(Text::from(lines)), content);
+
+        // Subtle current-line highlight: patch the background across the whole
+        // row (gutter + text) so empty cells are covered too.
+        if focused && self.cursor.line >= self.scroll_row {
+            let row = (self.cursor.line - self.scroll_row) as u16;
+            if row < content.height {
+                let row_rect = Rect::new(area.x, content.y + row, area.width, 1);
+                frame
+                    .buffer_mut()
+                    .set_style(row_rect, Style::new().bg(CURRENT_LINE_BG));
+            }
+        }
+
+        // Paint the selection over the text (after the current-line tint so the
+        // selected span wins where they overlap).
+        if let Some((sel_start, sel_end)) = self.ordered_selection() {
+            for row in 0..height {
+                let line_idx = self.scroll_row + row;
+                if line_idx < sel_start.0 || line_idx > sel_end.0 {
+                    continue;
+                }
+                let start_col = if line_idx == sel_start.0 { sel_start.1 } else { 0 };
+                // For lines fully inside the selection, extend one cell past the
+                // end of line so the selected newline reads as highlighted.
+                let end_col = if line_idx == sel_end.0 {
+                    sel_end.1
+                } else {
+                    self.line_len(buffer, line_idx) + 1
+                };
+                let vis_start = start_col.max(self.scroll_col);
+                if end_col <= vis_start {
+                    continue;
+                }
+                let sx = content.x + (vis_start - self.scroll_col) as u16;
+                let avail = content.width.saturating_sub(sx - content.x);
+                let w = ((end_col - vis_start) as u16).min(avail);
+                if w == 0 {
+                    continue;
+                }
+                let rect = Rect::new(sx, content.y + row as u16, w, 1);
+                frame
+                    .buffer_mut()
+                    .set_style(rect, Style::new().bg(SELECTION_BG));
+            }
+        }
 
         if focused {
-            let cx = area.x + (self.cursor.col.saturating_sub(self.scroll_col)) as u16;
-            let cy = area.y + (self.cursor.line.saturating_sub(self.scroll_row)) as u16;
+            let cx = content.x + (self.cursor.col.saturating_sub(self.scroll_col)) as u16;
+            let cy = content.y + (self.cursor.line.saturating_sub(self.scroll_row)) as u16;
             frame.set_cursor_position((cx, cy));
         }
     }
@@ -302,6 +423,12 @@ fn highlight_line(text: &str, syntax: Option<&Syntax>) -> Line<'static> {
         out.push(Span::raw(text[cursor..].to_string()));
     }
     Line::from(out)
+}
+
+/// Width (in digits) reserved for line numbers, given the line count. A floor
+/// of 3 keeps the gutter from jittering on small files.
+fn gutter_num_width(line_count: usize) -> usize {
+    line_count.to_string().len().max(3)
 }
 
 /// Given the current scroll offset, the cursor index, and the viewport size on
@@ -447,5 +574,72 @@ mod tests {
         assert_eq!(b.line_text(0), "llo");
         assert!(!p.has_selection());
         assert_eq!(p.cursor.col, 0);
+    }
+
+    #[test]
+    fn home_and_end_move_to_line_edges() {
+        let (mut p, b) = setup("hello\nworld");
+        p.move_down(&b, false); // line 1, col 0
+        p.move_line_end(&b, false);
+        assert_eq!((p.cursor.line, p.cursor.col), (1, 5));
+        p.move_line_start(&b, false);
+        assert_eq!((p.cursor.line, p.cursor.col), (1, 0));
+    }
+
+    #[test]
+    fn shift_end_extends_selection() {
+        let (mut p, b) = setup("hello");
+        p.move_line_end(&b, true);
+        assert!(p.has_selection());
+        assert_eq!(p.cursor.col, 5);
+    }
+
+    #[test]
+    fn plain_home_collapses_selection() {
+        let (mut p, b) = setup("hello");
+        p.move_right(&b, true);
+        assert!(p.has_selection());
+        p.move_line_start(&b, false);
+        assert!(!p.has_selection());
+        assert_eq!(p.cursor.col, 0);
+    }
+
+    #[test]
+    fn page_down_and_up_jump_by_viewport_height() {
+        let text = (0..20).map(|i| format!("line{i}")).collect::<Vec<_>>().join("\n");
+        let (mut p, b) = setup(&text);
+        p.last_height = 5; // pretend a 5-row viewport
+        p.page_down(&b, false);
+        assert_eq!(p.cursor.line, 5);
+        p.page_down(&b, false);
+        assert_eq!(p.cursor.line, 10);
+        p.page_up(&b, false);
+        assert_eq!(p.cursor.line, 5);
+    }
+
+    #[test]
+    fn page_down_clamps_to_last_line() {
+        let (mut p, b) = setup("a\nb\nc");
+        p.last_height = 100;
+        p.page_down(&b, false);
+        assert_eq!(p.cursor.line, 2); // last line, not past it
+    }
+
+    #[test]
+    fn shift_page_down_extends_selection() {
+        let text = (0..10).map(|i| i.to_string()).collect::<Vec<_>>().join("\n");
+        let (mut p, b) = setup(&text);
+        p.last_height = 3;
+        p.page_down(&b, true);
+        assert!(p.has_selection());
+        assert_eq!(p.cursor.line, 3);
+    }
+
+    #[test]
+    fn gutter_width_has_floor_of_three() {
+        assert_eq!(gutter_num_width(1), 3);
+        assert_eq!(gutter_num_width(999), 3);
+        assert_eq!(gutter_num_width(1000), 4);
+        assert_eq!(gutter_num_width(12345), 5);
     }
 }

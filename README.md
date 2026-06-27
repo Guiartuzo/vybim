@@ -2,8 +2,8 @@
 
 A minimalist, **modeless** terminal code editor — fast and snappy like `nano`/`vim`,
 but with a familiar VSCode-style editing model (arrow keys move, `Shift+Arrow`
-selects, `Ctrl+S` saves), a file-tree sidebar, split panes, syntax highlighting,
-and an integrated terminal.
+selects, `Ctrl+S` saves), a toggleable file-tree sidebar, split panes, line
+numbers, syntax highlighting, and an integrated terminal.
 
 > Status: **MVP foundation.** AI integration — the long-term differentiator — is
 > deliberately deferred to a future change. So are LSP, a command palette, and a
@@ -37,19 +37,22 @@ Modeless: you are always typing into the focused pane.
 | Key | Action |
 | --- | --- |
 | `Ctrl+Q` | Quit |
-| `Ctrl+B` | Toggle focus between the sidebar and the editor |
+| `Ctrl+B` | Show / hide the file-tree sidebar (focus follows) |
+| `F1` | Toggle the keybinding help overlay (`Esc` to close) |
 
 ### Editor pane
 | Key | Action |
 | --- | --- |
 | Arrows | Move the cursor |
-| `Shift`+Arrows | Extend a selection |
+| `Home` / `End` | Move to the start / end of the line |
+| `PageUp` / `PageDown` | Move up / down by a viewport height |
+| `Shift`+(Arrows / `Home` / `End` / `PageUp` / `PageDown`) | Extend a selection |
 | Printable keys | Insert text (replacing any selection) |
 | `Enter` | Split the line |
 | `Backspace` / `Delete` | Delete (joining lines at boundaries) |
 | `Tab` | Insert four spaces |
 | `Ctrl+S` | Save |
-| `Ctrl+\` | Split the pane vertically |
+| `Ctrl+E` | Split the pane vertically (`Ctrl+\` also works) |
 | `Ctrl+T` | Open an integrated terminal pane |
 | `Ctrl+W` | Close the focused pane |
 | `Alt+Left` / `Alt+Right` | Move focus between panes |
