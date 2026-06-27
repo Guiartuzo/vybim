@@ -4,3 +4,7 @@
 # Editor/OS cruft
 *.swp
 .DS_Store
+
+# Tooling — keep these out of version control (code only)
+/.claude/
+/openspec/
