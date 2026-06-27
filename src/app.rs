@@ -6,22 +6,24 @@
 
 use std::io;
 
-use ratatui::Frame;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use ratatui::layout::Alignment;
-use ratatui::widgets::{Block, Borders, Paragraph};
 
 use crate::terminal::Tui;
+use crate::view::EditorView;
 
 /// Central application state — the single owner of everything NyxVim tracks.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct App {
     should_quit: bool,
+    view: EditorView,
 }
 
 impl App {
-    pub fn new() -> Self {
-        Self::default()
+    pub fn new(view: EditorView) -> Self {
+        Self {
+            should_quit: false,
+            view,
+        }
     }
 
     /// Run the main loop until a quit is requested.
@@ -31,7 +33,7 @@ impl App {
     /// never redraws on its own.
     pub fn run(&mut self, terminal: &mut Tui) -> io::Result<()> {
         while !self.should_quit {
-            terminal.draw(|frame| self.render(frame))?;
+            terminal.draw(|frame| self.view.render(frame, frame.area()))?;
             self.handle_events()?;
         }
         Ok(())
@@ -56,14 +58,6 @@ impl App {
             self.should_quit = true;
         }
     }
-
-    fn render(&self, frame: &mut Frame) {
-        let block = Block::default().title(" NyxVim ").borders(Borders::ALL);
-        let body = Paragraph::new("Welcome to NyxVim\n\nPress Ctrl+Q to quit.")
-            .block(block)
-            .alignment(Alignment::Center);
-        frame.render_widget(body, frame.area());
-    }
 }
 
 /// The global quit chord: Ctrl+Q.
@@ -74,6 +68,11 @@ fn is_quit(key: KeyEvent) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::buffer::Buffer;
+
+    fn test_app() -> App {
+        App::new(EditorView::new(Buffer::empty()))
+    }
 
     fn press(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
         KeyEvent::new(code, modifiers)
@@ -81,7 +80,7 @@ mod tests {
 
     #[test]
     fn ctrl_q_requests_quit() {
-        let mut app = App::new();
+        let mut app = test_app();
         assert!(!app.should_quit);
         app.on_key(press(KeyCode::Char('q'), KeyModifiers::CONTROL));
         assert!(app.should_quit);
@@ -89,7 +88,7 @@ mod tests {
 
     #[test]
     fn plain_q_does_not_quit() {
-        let mut app = App::new();
+        let mut app = test_app();
         app.on_key(press(KeyCode::Char('q'), KeyModifiers::NONE));
         assert!(!app.should_quit);
     }

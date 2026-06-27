@@ -14,10 +14,10 @@
 
 ## 3. Open and display a file (capability: text-editing)
 
-- [ ] 3.1 Load a file path into a `ropey::Rope` buffer; store buffers centrally in `App`, keyed by ID
-- [ ] 3.2 Render the buffer in a pane with line-based viewport rendering
-- [ ] 3.3 Implement viewport scrolling that keeps the cursor visible (vertical and horizontal)
-- [ ] 3.4 Accept an initial file path as a CLI argument to open on launch
+- [x] 3.1 Load a file path into a `ropey::Rope` buffer (central ID-keyed store deferred to 5.1 where panes need it)
+- [x] 3.2 Render the buffer in a pane with line-based viewport rendering
+- [x] 3.3 Implement viewport scrolling that keeps the cursor visible (vertical and horizontal)
+- [x] 3.4 Accept an initial file path as a CLI argument to open on launch
 
 ## 4. Modeless editing (capability: text-editing)
 
