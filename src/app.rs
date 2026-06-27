@@ -1,11 +1,17 @@
 //! The central application state and the main render/event loop.
 //!
 //! [`App`] is the single owner of all application state: the central buffer
-//! store, the list of panes (each referencing a buffer by id), and which pane
-//! is focused. The file tree is added in a later milestone.
+//! store, the panes (editor or terminal), the file tree, and focus.
+//!
+//! The loop is driven by a single [`AppEvent`] channel. A dedicated input
+//! thread forwards keyboard events, and each terminal pane's reader thread
+//! forwards shell output, into the same channel — so the UI wakes for both
+//! without the main loop busy-spinning.
 
 use std::io;
 use std::path::PathBuf;
+use std::sync::mpsc::{self, Sender};
+use std::thread;
 
 use ratatui::Frame;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -16,9 +22,18 @@ use crate::file_tree::FileTree;
 use crate::pane::EditorPane;
 use crate::syntax::Syntax;
 use crate::terminal::Tui;
+use crate::terminal_pane::TerminalPane;
 
 /// Width of the file-tree sidebar, in columns.
 const SIDEBAR_WIDTH: u16 = 28;
+
+/// An event delivered to the main loop, from input or from a terminal pane.
+#[derive(Debug)]
+pub enum AppEvent {
+    Input(Event),
+    PtyOutput(usize, Vec<u8>),
+    PtyExit(usize),
+}
 
 /// Which region currently receives keyboard input.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -27,21 +42,32 @@ enum Focus {
     Editor,
 }
 
+/// A pane in the editor area: a text editor or an integrated terminal.
+#[derive(Debug)]
+enum Pane {
+    Editor(EditorPane),
+    Terminal(TerminalPane),
+}
+
 /// Central application state — the single owner of everything NyxVim tracks.
 #[derive(Debug)]
 pub struct App {
     should_quit: bool,
-    /// Central buffer store; panes reference entries by index (`buffer_id`).
+    /// Central buffer store; editor panes reference entries by index.
     buffers: Vec<Buffer>,
     /// Per-buffer highlighter (parallel to `buffers`); `None` when the buffer's
     /// language has no bundled grammar.
     syntaxes: Vec<Option<Syntax>>,
-    /// Side-by-side editor panes (vertical splits).
-    panes: Vec<EditorPane>,
+    /// Side-by-side panes (vertical splits).
+    panes: Vec<Pane>,
     /// Index into `panes` of the pane receiving input.
     focused: usize,
     tree: FileTree,
     focus: Focus,
+    /// Sender for spawning terminal panes; set once the loop starts.
+    event_tx: Option<Sender<AppEvent>>,
+    /// Monotonic id source for terminal panes.
+    next_terminal_id: usize,
 }
 
 impl App {
@@ -52,56 +78,81 @@ impl App {
             should_quit: false,
             buffers: vec![buffer],
             syntaxes: vec![syntax],
-            panes: vec![EditorPane::new(0)],
+            panes: vec![Pane::Editor(EditorPane::new(0))],
             focused: 0,
             tree: FileTree::new(root),
             focus: Focus::Editor,
+            event_tx: None,
+            next_terminal_id: 0,
         }
     }
 
     /// Run the main loop until a quit is requested.
     ///
-    /// Each iteration draws the current state, then blocks waiting for the next
-    /// input event. Blocking on input means an idle editor consumes no CPU and
-    /// never redraws on its own.
+    /// Input and terminal output are multiplexed onto one channel; the loop
+    /// blocks on the channel, so it idles without busy-spinning yet still wakes
+    /// when a terminal pane produces output.
     pub fn run(&mut self, terminal: &mut Tui) -> io::Result<()> {
+        let (tx, rx) = mpsc::channel();
+        self.event_tx = Some(tx.clone());
+
+        // Forward terminal input events onto the shared channel.
+        thread::spawn(move || {
+            while let Ok(ev) = event::read() {
+                if tx.send(AppEvent::Input(ev)).is_err() {
+                    break;
+                }
+            }
+        });
+
         while !self.should_quit {
             terminal.draw(|frame| self.render(frame))?;
-            self.handle_events()?;
+
+            match rx.recv() {
+                Ok(ev) => self.handle_app_event(ev),
+                Err(_) => break,
+            }
+            // Coalesce any already-queued events (e.g. bursty shell output)
+            // before the next redraw.
+            while let Ok(ev) = rx.try_recv() {
+                self.handle_app_event(ev);
+            }
         }
         Ok(())
     }
 
+    fn handle_app_event(&mut self, ev: AppEvent) {
+        match ev {
+            AppEvent::Input(Event::Key(key)) if key.kind == KeyEventKind::Press => self.on_key(key),
+            AppEvent::Input(_) => {}
+            AppEvent::PtyOutput(id, bytes) => self.feed_terminal(id, &bytes),
+            AppEvent::PtyExit(id) => self.on_terminal_exit(id),
+        }
+    }
+
     fn render(&mut self, frame: &mut Frame) {
-        // Sidebar on the left, the editor area filling the rest.
-        let [sidebar, editor_area] =
+        // Sidebar on the left, the pane area filling the rest.
+        let [sidebar, pane_area] =
             Layout::horizontal([Constraint::Length(SIDEBAR_WIDTH), Constraint::Fill(1)])
                 .areas(frame.area());
 
         self.tree
             .render(frame, sidebar, self.focus == Focus::Sidebar);
 
-        // Divide the editor area evenly across panes (vertical splits).
+        // Divide the pane area evenly across panes (vertical splits).
         let constraints = vec![Constraint::Fill(1); self.panes.len()];
-        let regions = Layout::horizontal(constraints).split(editor_area);
+        let regions = Layout::horizontal(constraints).split(pane_area);
         for (i, pane) in self.panes.iter_mut().enumerate() {
-            let buffer = &self.buffers[pane.buffer_id];
-            let syntax = self.syntaxes[pane.buffer_id].as_ref();
             let focused = self.focus == Focus::Editor && i == self.focused;
-            pane.render(frame, regions[i], buffer, syntax, focused);
-        }
-    }
-
-    /// Block for the next event and update state accordingly.
-    fn handle_events(&mut self) -> io::Result<()> {
-        if let Event::Key(key) = event::read()? {
-            // Only react to presses, not key-release/repeat events some
-            // terminals emit, so a single keystroke does one thing.
-            if key.kind == KeyEventKind::Press {
-                self.on_key(key);
+            match pane {
+                Pane::Editor(ed) => {
+                    let buffer = &self.buffers[ed.buffer_id];
+                    let syntax = self.syntaxes[ed.buffer_id].as_ref();
+                    ed.render(frame, regions[i], buffer, syntax, focused);
+                }
+                Pane::Terminal(term) => term.render(frame, regions[i], focused),
             }
         }
-        Ok(())
     }
 
     /// Handle a key press. Truly global chords (quit, toggle sidebar) are
@@ -123,7 +174,7 @@ impl App {
 
         match self.focus {
             Focus::Sidebar => self.on_sidebar_key(key),
-            Focus::Editor => self.on_editor_key(key),
+            Focus::Editor => self.on_pane_key(key),
         }
     }
 
@@ -143,48 +194,27 @@ impl App {
         }
     }
 
-    /// Keys while an editor pane is focused: pane management and editing.
-    fn on_editor_key(&mut self, key: KeyEvent) {
+    /// Keys while the pane area is focused: pane-management chords, otherwise
+    /// routed to the focused pane (editor or terminal).
+    fn on_pane_key(&mut self, key: KeyEvent) {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
 
         match key.code {
-            KeyCode::Char('s') if ctrl => self.save_focused(),
-            KeyCode::Char('\\') if ctrl => self.split_vertical(),
-            KeyCode::Char('w') if ctrl => self.close_focused_pane(),
-            KeyCode::Left if alt => self.focus_prev(),
-            KeyCode::Right if alt => self.focus_next(),
-            _ => self.dispatch_to_focused(key),
-        }
-    }
-
-    /// Route an editing/movement key to the focused pane and its buffer.
-    fn dispatch_to_focused(&mut self, key: KeyEvent) {
-        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-        let alt = key.modifiers.contains(KeyModifiers::ALT);
-        let extend = key.modifiers.contains(KeyModifiers::SHIFT);
-
-        let pane = &mut self.panes[self.focused];
-        let buffer = &mut self.buffers[pane.buffer_id];
-
-        match key.code {
-            KeyCode::Left => pane.move_left(buffer, extend),
-            KeyCode::Right => pane.move_right(buffer, extend),
-            KeyCode::Up => pane.move_up(buffer, extend),
-            KeyCode::Down => pane.move_down(buffer, extend),
-            KeyCode::Enter => pane.insert_newline(buffer),
-            KeyCode::Backspace => pane.backspace(buffer),
-            KeyCode::Delete => pane.delete_forward(buffer),
-            KeyCode::Tab => {
-                // Insert spaces so one character always equals one column,
-                // keeping cursor placement correct.
-                for _ in 0..4 {
-                    pane.insert_char(buffer, ' ');
-                }
-            }
-            // Printable input: any char that isn't part of a Ctrl/Alt chord.
-            KeyCode::Char(c) if !ctrl && !alt => pane.insert_char(buffer, c),
+            KeyCode::Char('\\') if ctrl => return self.split_vertical(),
+            KeyCode::Char('t') if ctrl => return self.open_terminal(),
+            KeyCode::Char('w') if ctrl => return self.close_focused_pane(),
+            KeyCode::Left if alt => return self.focus_prev(),
+            KeyCode::Right if alt => return self.focus_next(),
             _ => {}
+        }
+
+        match &mut self.panes[self.focused] {
+            Pane::Editor(ed) => {
+                let buffer = &mut self.buffers[ed.buffer_id];
+                dispatch_editor(ed, buffer, key);
+            }
+            Pane::Terminal(term) => term.send_key(key),
         }
     }
 
@@ -204,24 +234,38 @@ impl App {
             let id = self.buffers.len();
             self.buffers.push(buffer);
             self.syntaxes.push(syntax);
-            self.panes[self.focused].set_buffer(id);
+            match &mut self.panes[self.focused] {
+                Pane::Editor(ed) => ed.set_buffer(id),
+                // Opening a file replaces a focused terminal with an editor.
+                pane => *pane = Pane::Editor(EditorPane::new(id)),
+            }
             self.focus = Focus::Editor;
         }
     }
 
     // --- pane management ---------------------------------------------------
 
-    fn save_focused(&mut self) {
-        let buffer_id = self.panes[self.focused].buffer_id;
-        let _ = self.buffers[buffer_id].save();
+    /// Split the focused editor pane, placing a new pane viewing the same
+    /// buffer beside it. No-op when a terminal is focused.
+    fn split_vertical(&mut self) {
+        if let Pane::Editor(ed) = &self.panes[self.focused] {
+            let new_pane = Pane::Editor(EditorPane::new(ed.buffer_id));
+            self.panes.insert(self.focused + 1, new_pane);
+            self.focused += 1;
+        }
     }
 
-    /// Split the focused pane, placing a new pane viewing the same buffer
-    /// beside it and moving focus to the new pane.
-    fn split_vertical(&mut self) {
-        let buffer_id = self.panes[self.focused].buffer_id;
-        self.panes.insert(self.focused + 1, EditorPane::new(buffer_id));
-        self.focused += 1;
+    /// Open a new integrated terminal pane beside the focused one.
+    fn open_terminal(&mut self) {
+        let Some(tx) = self.event_tx.clone() else {
+            return;
+        };
+        let id = self.next_terminal_id;
+        if let Ok(term) = TerminalPane::spawn(id, tx) {
+            self.next_terminal_id += 1;
+            self.panes.insert(self.focused + 1, Pane::Terminal(term));
+            self.focused += 1;
+        }
     }
 
     /// Close the focused pane, unless it is the last one.
@@ -230,6 +274,35 @@ impl App {
             return;
         }
         self.panes.remove(self.focused);
+        self.clamp_focus();
+    }
+
+    /// Deliver shell output to the matching terminal pane.
+    fn feed_terminal(&mut self, id: usize, bytes: &[u8]) {
+        for pane in &mut self.panes {
+            if let Pane::Terminal(term) = pane {
+                if term.id == id {
+                    term.process(bytes);
+                    return;
+                }
+            }
+        }
+    }
+
+    /// A terminal's shell exited: remove its pane, keeping at least one pane.
+    fn on_terminal_exit(&mut self, id: usize) {
+        if let Some(idx) = self.panes.iter().position(
+            |p| matches!(p, Pane::Terminal(t) if t.id == id),
+        ) {
+            self.panes.remove(idx);
+            if self.panes.is_empty() {
+                self.panes.push(Pane::Editor(EditorPane::new(0)));
+            }
+            self.clamp_focus();
+        }
+    }
+
+    fn clamp_focus(&mut self) {
         if self.focused >= self.panes.len() {
             self.focused = self.panes.len() - 1;
         }
@@ -244,6 +317,35 @@ impl App {
     }
 }
 
+/// Route an editing/movement key to an editor pane and its buffer.
+fn dispatch_editor(ed: &mut EditorPane, buffer: &mut Buffer, key: KeyEvent) {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let alt = key.modifiers.contains(KeyModifiers::ALT);
+    let extend = key.modifiers.contains(KeyModifiers::SHIFT);
+
+    match key.code {
+        KeyCode::Char('s') if ctrl => {
+            let _ = buffer.save();
+        }
+        KeyCode::Left => ed.move_left(buffer, extend),
+        KeyCode::Right => ed.move_right(buffer, extend),
+        KeyCode::Up => ed.move_up(buffer, extend),
+        KeyCode::Down => ed.move_down(buffer, extend),
+        KeyCode::Enter => ed.insert_newline(buffer),
+        KeyCode::Backspace => ed.backspace(buffer),
+        KeyCode::Delete => ed.delete_forward(buffer),
+        KeyCode::Tab => {
+            // Insert spaces so one character always equals one column.
+            for _ in 0..4 {
+                ed.insert_char(buffer, ' ');
+            }
+        }
+        // Printable input: any char that isn't part of a Ctrl/Alt chord.
+        KeyCode::Char(c) if !ctrl && !alt => ed.insert_char(buffer, c),
+        _ => {}
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -254,6 +356,14 @@ mod tests {
 
     fn press(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
         KeyEvent::new(code, modifiers)
+    }
+
+    /// The buffer id of an editor pane (panics if it is a terminal).
+    fn buffer_id_at(app: &App, i: usize) -> usize {
+        match &app.panes[i] {
+            Pane::Editor(ed) => ed.buffer_id,
+            _ => panic!("pane {i} is not an editor"),
+        }
     }
 
     #[test]
@@ -296,7 +406,7 @@ mod tests {
 
         assert_eq!(app.focus, Focus::Editor);
         assert_eq!(app.buffers.len(), 2);
-        let id = app.panes[app.focused].buffer_id;
+        let id = buffer_id_at(&app, app.focused);
         assert_eq!(app.buffers[id].line_text(0), "from disk");
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -308,7 +418,7 @@ mod tests {
         assert_eq!(app.panes.len(), 2);
         assert_eq!(app.focused, 1);
         // both panes view the same buffer
-        assert_eq!(app.panes[0].buffer_id, app.panes[1].buffer_id);
+        assert_eq!(buffer_id_at(&app, 0), buffer_id_at(&app, 1));
     }
 
     #[test]

@@ -56,14 +56,14 @@
 
 ## 8. Integrated terminal pane (capability: integrated-terminal)
 
-- [ ] 8.1 Add `portable-pty`; spawn the user's default shell on a PTY from a terminal pane
-- [ ] 8.2 Spawn a reader thread that pumps PTY output over a channel and wakes the event loop
-- [ ] 8.3 Integrate a VT parser (`alacritty_terminal`, with `vt100` as fallback) to maintain a cell grid from PTY output
-- [ ] 8.4 Render the terminal grid in the pane, including SGR colors, cursor moves, line clears, and scrolling
-- [ ] 8.5 Forward keystrokes from the focused terminal pane to the PTY
-- [ ] 8.6 Resize the PTY when the pane dimensions change
-- [ ] 8.7 Terminate the shell child process and release resources when the terminal pane is closed
-- [ ] 8.8 Confirm the editor and other panes stay responsive during continuous terminal output
+- [x] 8.1 Add `portable-pty`; spawn the user's default shell on a PTY from a terminal pane
+- [x] 8.2 Spawn a reader thread that pumps PTY output over a channel and wakes the event loop
+- [x] 8.3 Integrate a VT parser (chose `vt100` per the design's open question) to maintain a cell grid from PTY output
+- [x] 8.4 Render the terminal grid in the pane, including SGR colors, cursor moves, line clears, and scrolling
+- [x] 8.5 Forward keystrokes from the focused terminal pane to the PTY
+- [x] 8.6 Resize the PTY when the pane dimensions change
+- [x] 8.7 Terminate the shell child process and release resources when the terminal pane is closed
+- [x] 8.8 Confirm the editor and other panes stay responsive during continuous terminal output
 
 ## 9. Polish and verification
 
