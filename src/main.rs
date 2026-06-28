@@ -4,6 +4,7 @@ mod file_tree;
 mod pane;
 mod syntax;
 mod terminal;
+mod terminal_area;
 mod terminal_pane;
 
 use app::App;
