@@ -195,7 +195,12 @@ impl FileTree {
             lines.push(Line::styled(text, style));
         }
 
-        let block = Block::default().borders(Borders::RIGHT);
+        // A rounded box on all sides; the file list renders inside it. The
+        // Paragraph's `.block(...)` clips the lines to the block's inner area.
+        let block = Block::new()
+            .borders(Borders::ALL)
+            .border_type(theme.border_type())
+            .border_style(Style::new().fg(theme.border));
         frame.render_widget(Paragraph::new(Text::from(lines)).block(block), area);
     }
 }

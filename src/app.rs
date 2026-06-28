@@ -310,20 +310,12 @@ impl App {
             body
         };
 
-        // Terminal area docked on the right when visible, separated from the
-        // editors by a thin divider (the same style as inter-pane dividers).
+        // Terminal area docked on the right when visible. Its own box border
+        // separates it from the editors, so no extra divider column is needed.
         let pane_area = if self.terminal_area.is_visible() {
-            let [editors, divider, term] = Layout::horizontal([
-                Constraint::Fill(1),
-                Constraint::Length(1),
-                Constraint::Length(TERMINAL_AREA_WIDTH),
-            ])
-            .areas(main);
-            let div = Block::new()
-                .borders(Borders::LEFT)
-                .border_type(theme.border_type())
-                .border_style(Style::new().fg(theme.border));
-            frame.render_widget(div, divider);
+            let [editors, term] =
+                Layout::horizontal([Constraint::Fill(1), Constraint::Length(TERMINAL_AREA_WIDTH)])
+                    .areas(main);
             self.terminal_area
                 .render(frame, term, self.focus == Focus::Terminal, &theme);
             editors

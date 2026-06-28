@@ -227,33 +227,21 @@ impl DiffView {
     /// ensured input is routed here while it is open.
     pub fn render(&mut self, frame: &mut Frame, area: Rect, theme: &Theme) {
         frame.render_widget(Clear, area);
-        let [list_area, divider, diff_area] = Layout::horizontal([
-            Constraint::Length(LIST_WIDTH),
-            Constraint::Length(1),
-            Constraint::Fill(1),
-        ])
-        .areas(area);
+        // Two adjacent panels; each is its own rounded box (no divider column —
+        // the boxes' borders separate them).
+        let [list_area, diff_area] =
+            Layout::horizontal([Constraint::Length(LIST_WIDTH), Constraint::Fill(1)]).areas(area);
 
         self.render_list(frame, list_area, theme);
-        let div = Block::new()
-            .borders(Borders::LEFT)
-            .border_type(theme.border_type())
-            .border_style(Style::new().fg(theme.border));
-        frame.render_widget(div, divider);
         self.render_diff(frame, diff_area, theme);
     }
 
     fn render_list(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
-        let title = if self.root.is_none() {
-            " no git repository "
-        } else if self.files.is_empty() {
-            " no changes "
-        } else {
-            " Changes "
-        };
+        // Rounded, untitled box; the changed-files list renders inside it.
         let block = Block::new()
-            .borders(Borders::NONE)
-            .title(Span::styled(title, Style::new().fg(theme.accent)));
+            .borders(Borders::ALL)
+            .border_type(theme.border_type())
+            .border_style(Style::new().fg(theme.border));
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
@@ -284,16 +272,24 @@ impl DiffView {
     }
 
     fn render_diff(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
+        // Rounded, untitled box; the diff content renders inside it.
+        let block = Block::new()
+            .borders(Borders::ALL)
+            .border_type(theme.border_type())
+            .border_style(Style::new().fg(theme.border));
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+
         // Empty / placeholder states.
         if let Some(msg) = self.placeholder() {
             let p = Paragraph::new(msg).style(Style::new().fg(theme.text_muted));
-            frame.render_widget(p, area);
+            frame.render_widget(p, inner);
             return;
         }
 
         let path = self.files[self.selected].path.clone();
         let [header, body] =
-            Layout::vertical([Constraint::Length(1), Constraint::Fill(1)]).areas(area);
+            Layout::vertical([Constraint::Length(1), Constraint::Fill(1)]).areas(inner);
         let diff_focused = self.focus == DiffFocus::Diff;
         let header_style = if diff_focused {
             Style::new().fg(theme.text).add_modifier(Modifier::BOLD)
