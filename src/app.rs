@@ -21,6 +21,7 @@ use ratatui::text::{Line, Text};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 
 use crate::buffer::Buffer;
+use crate::complete::{Completion, MAX_CANDIDATES};
 use crate::diff_view::DiffView;
 use crate::file_tree::FileTree;
 use crate::minibuffer::{MiniMode, Minibuffer};
@@ -65,6 +66,10 @@ const BINDINGS: &[KeyBinding] = &[
     KeyBinding { group: "Editor", keys: "Ctrl+Y", action: "Redo", footer: None },
     KeyBinding { group: "Editor", keys: "Ctrl+F", action: "Find", footer: Some("find") },
     KeyBinding { group: "Editor", keys: "Ctrl+G", action: "Go to line", footer: None },
+    KeyBinding { group: "Editor", keys: "Ctrl+N", action: "Autocomplete word (Ctrl+Space alias)", footer: Some("complete") },
+    KeyBinding { group: "Editor", keys: "Up / Down", action: "Completion: previous / next", footer: None },
+    KeyBinding { group: "Editor", keys: "Tab / Enter", action: "Completion: accept", footer: None },
+    KeyBinding { group: "Editor", keys: "Esc", action: "Completion: dismiss", footer: None },
     KeyBinding { group: "Editor", keys: "Ctrl+E", action: "Split pane vertically", footer: Some("split") },
     KeyBinding { group: "Editor", keys: "Ctrl+\\", action: "Split pane (alias)", footer: None },
     KeyBinding { group: "Editor", keys: "Ctrl+W", action: "Close pane", footer: Some("close") },
@@ -122,6 +127,9 @@ pub struct App {
     /// The diff view, if open. While `Some` it claims the body and captures
     /// input (read-only — it never edits a buffer).
     diff: Option<DiffView>,
+    /// The active completion popup, if any. Semi-modal: while open it intercepts
+    /// only navigate/accept/dismiss keys; other keys edit and re-query it.
+    completion: Option<Completion>,
     tree: FileTree,
     focus: Focus,
     /// Sender for spawning terminal panes; set once the loop starts.
@@ -147,6 +155,7 @@ impl App {
             terminal_area: TerminalArea::new(),
             minibuffer: None,
             diff: None,
+            completion: None,
             tree: FileTree::new(root),
             focus: Focus::Editor,
             event_tx: None,
@@ -273,6 +282,14 @@ impl App {
             frame.render_widget(divider, regions[i * 2 + 1]);
         }
 
+        // The completion popup is anchored to the focused pane's cursor.
+        if self.focus == Focus::Editor
+            && let Some(comp) = &self.completion
+            && let Some(anchor) = self.panes[self.focused].cursor_screen()
+        {
+            render_completion_popup(frame, anchor, comp);
+        }
+
         // The minibuffer prompt takes over the bottom row while open, and owns
         // the hardware cursor (the focused pane suppresses its own cursor then).
         if let Some(mini) = &self.minibuffer {
@@ -375,6 +392,19 @@ impl App {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
 
+        // While the completion popup is open it is semi-modal: navigate, accept,
+        // and dismiss are intercepted here — before `dispatch_editor` — so `Tab`
+        // and `Enter` accept the selection instead of inserting spaces/newlines.
+        if let Some(comp) = self.completion.as_mut() {
+            match key.code {
+                KeyCode::Up => return comp.move_up(),
+                KeyCode::Down => return comp.move_down(),
+                KeyCode::Tab | KeyCode::Enter => return self.completion_accept(),
+                KeyCode::Esc => return self.completion_dismiss(),
+                _ => {}
+            }
+        }
+
         match key.code {
             // Primary split chord. `ctrl+e` is layout-independent and reachable
             // (e.g. on ABNT, where `ctrl+\` is impractical); `ctrl+\` stays as
@@ -387,12 +417,23 @@ impl App {
             KeyCode::Char('g') if ctrl => return self.open_goto_line(),
             KeyCode::Left if alt => return self.focus_prev(),
             KeyCode::Right if alt => return self.focus_next(),
+            // Autocomplete trigger: `Ctrl+N` (reliable) plus a best-effort
+            // `Ctrl+Space` alias (reported as `Char(' ')`+Ctrl or `Null`).
+            KeyCode::Char('n') if ctrl => return self.open_completion(),
+            KeyCode::Char(' ') if ctrl => return self.open_completion(),
+            KeyCode::Null => return self.open_completion(),
             _ => {}
         }
 
         let ed = &mut self.panes[self.focused];
         let buffer = &mut self.buffers[ed.buffer_id];
         dispatch_editor(ed, buffer, key);
+
+        // After a pass-through editing key, re-query the popup so the list tracks
+        // the buffer; it closes itself when the prefix no longer matches.
+        if self.completion.is_some() {
+            self.completion_requery();
+        }
     }
 
     /// Keys while the terminal area is focused: area-management chords (new,
@@ -418,6 +459,7 @@ impl App {
     /// Show or hide the sidebar, moving focus automatically: showing it focuses
     /// the tree (ready to navigate); hiding it returns focus to the editor.
     fn toggle_sidebar(&mut self) {
+        self.completion = None;
         self.sidebar_visible = !self.sidebar_visible;
         self.focus = if self.sidebar_visible {
             Focus::Sidebar
@@ -443,6 +485,7 @@ impl App {
     /// Split the focused editor pane, placing a new pane viewing the same
     /// buffer beside it.
     fn split_vertical(&mut self) {
+        self.completion = None;
         let buffer_id = self.panes[self.focused].buffer_id;
         self.panes.insert(self.focused + 1, EditorPane::new(buffer_id));
         self.focused += 1;
@@ -453,6 +496,7 @@ impl App {
         if self.panes.len() <= 1 {
             return;
         }
+        self.completion = None;
         self.panes.remove(self.focused);
         self.clamp_focus();
     }
@@ -463,6 +507,7 @@ impl App {
     /// it focuses the terminal (spawning a first one if the area is empty);
     /// hiding it returns focus to the editor.
     fn toggle_terminal_area(&mut self) {
+        self.completion = None;
         if self.terminal_area.is_visible() {
             self.terminal_area.hide();
             self.focus = Focus::Editor;
@@ -478,6 +523,7 @@ impl App {
     /// Spawn a new terminal into the area, make it active, show the area, and
     /// move focus into it.
     fn spawn_terminal(&mut self) {
+        self.completion = None;
         let Some(tx) = self.event_tx.clone() else {
             return;
         };
@@ -502,6 +548,7 @@ impl App {
     /// Open the search prompt against the focused pane, saving its cursor as the
     /// search origin so a cancel can return there.
     fn open_search(&mut self) {
+        self.completion = None;
         self.panes[self.focused].search_begin();
         self.minibuffer = Some(Minibuffer::search());
         self.focus = Focus::Minibuffer;
@@ -509,6 +556,7 @@ impl App {
 
     /// Open the go-to-line prompt against the focused pane.
     fn open_goto_line(&mut self) {
+        self.completion = None;
         self.minibuffer = Some(Minibuffer::goto_line());
         self.focus = Focus::Minibuffer;
     }
@@ -601,10 +649,54 @@ impl App {
         self.focus = Focus::Editor;
     }
 
+    // --- autocomplete ------------------------------------------------------
+
+    /// Open the completion popup for the word before the focused pane's cursor.
+    /// A no-op (leaves it closed) when there is no prefix or nothing matches.
+    fn open_completion(&mut self) {
+        let ed = &self.panes[self.focused];
+        let buffer = &self.buffers[ed.buffer_id];
+        let cursor = (ed.cursor.line, ed.cursor.col);
+        self.completion = Completion::open(buffer, cursor);
+    }
+
+    /// Re-gather candidates for the focused pane's current cursor, closing the
+    /// popup when the cursor has left the word or nothing matches.
+    fn completion_requery(&mut self) {
+        let ed = &self.panes[self.focused];
+        let buffer = &self.buffers[ed.buffer_id];
+        let cursor = (ed.cursor.line, ed.cursor.col);
+        let keep = self
+            .completion
+            .as_mut()
+            .is_some_and(|c| c.requery(buffer, cursor));
+        if !keep {
+            self.completion = None;
+        }
+    }
+
+    /// Accept the selected candidate: swap the typed prefix for the full word and
+    /// close the popup.
+    fn completion_accept(&mut self) {
+        if let Some(comp) = self.completion.take()
+            && let Some(word) = comp.selected_word()
+        {
+            let ed = &mut self.panes[self.focused];
+            let buffer = &mut self.buffers[ed.buffer_id];
+            ed.complete_accept(buffer, comp.prefix_start, word);
+        }
+    }
+
+    /// Dismiss the popup without changing the buffer.
+    fn completion_dismiss(&mut self) {
+        self.completion = None;
+    }
+
     // --- diff view ---------------------------------------------------------
 
     /// Open the diff view, snapshotting git state, and route input to it.
     fn open_diff_view(&mut self) {
+        self.completion = None;
         self.diff = Some(DiffView::open());
         self.focus = Focus::Diff;
     }
@@ -670,10 +762,12 @@ impl App {
     }
 
     fn focus_next(&mut self) {
+        self.completion = None;
         self.focused = (self.focused + 1) % self.panes.len();
     }
 
     fn focus_prev(&mut self) {
+        self.completion = None;
         self.focused = (self.focused + self.panes.len() - 1) % self.panes.len();
     }
 }
@@ -739,6 +833,63 @@ fn render_help_overlay(frame: &mut Frame) {
         .borders(Borders::ALL)
         .border_style(Style::new().fg(Color::Blue))
         .title(" NyxVim — Keybindings ");
+    frame.render_widget(Clear, area);
+    frame.render_widget(Paragraph::new(Text::from(lines)).block(block), area);
+}
+
+/// Draw the completion popup as a bordered list anchored just below the cursor
+/// (`anchor` is the cursor's screen position), flipping above when there is no
+/// room below. Rows and width are bounded; the selected entry is highlighted.
+fn render_completion_popup(frame: &mut Frame, anchor: (u16, u16), comp: &Completion) {
+    let screen = frame.area();
+    let rows = comp.candidates.len().min(MAX_CANDIDATES);
+    if rows == 0 {
+        return;
+    }
+
+    // Width fits the longest candidate; height fits the rows. Both include the
+    // one-cell border on each side, and are clamped to the screen.
+    let longest = comp
+        .candidates
+        .iter()
+        .take(rows)
+        .map(|c| c.chars().count())
+        .max()
+        .unwrap_or(0);
+    let w = ((longest as u16).saturating_add(2)).min(screen.width).max(1);
+    let h = ((rows as u16).saturating_add(2)).min(screen.height).max(1);
+
+    let (ax, ay) = anchor;
+    // Prefer below the cursor; flip above when the box would overflow the bottom.
+    let bottom = screen.y + screen.height;
+    let y = if ay + 1 + h <= bottom {
+        ay + 1
+    } else {
+        ay.saturating_sub(h)
+    };
+    // Keep the box on screen horizontally.
+    let max_x = screen.x + screen.width.saturating_sub(w);
+    let x = ax.min(max_x);
+
+    let lines: Vec<Line> = comp
+        .candidates
+        .iter()
+        .take(rows)
+        .enumerate()
+        .map(|(i, cand)| {
+            let style = if i == comp.selected {
+                Style::new().bg(Color::Blue).fg(Color::White)
+            } else {
+                Style::new().fg(Color::Gray)
+            };
+            Line::styled(cand.clone(), style)
+        })
+        .collect();
+
+    let block = Block::new()
+        .borders(Borders::ALL)
+        .border_style(Style::new().fg(Color::DarkGray));
+    let area = Rect::new(x, y, w, h);
     frame.render_widget(Clear, area);
     frame.render_widget(Paragraph::new(Text::from(lines)).block(block), area);
 }
@@ -1069,5 +1220,141 @@ mod tests {
         app.on_key(press(KeyCode::Char('x'), KeyModifiers::NONE)); // ignored
         app.on_key(press(KeyCode::Char('2'), KeyModifiers::NONE));
         assert_eq!(app.minibuffer.as_ref().unwrap().input, "2");
+    }
+
+    // --- autocomplete ------------------------------------------------------
+
+    /// Move the focused pane's cursor to `(line, col)`.
+    fn place_cursor(app: &mut App, line: usize, col: usize) {
+        let p = &mut app.panes[app.focused];
+        p.cursor.line = line;
+        p.cursor.col = col;
+        p.cursor.target_col = col;
+    }
+
+    /// Type a Ctrl+N trigger.
+    fn trigger_completion(app: &mut App) {
+        app.on_key(press(KeyCode::Char('n'), KeyModifiers::CONTROL));
+    }
+
+    #[test]
+    fn completion_opens_with_matching_words() {
+        // "al" before the cursor; alpha/alpine match.
+        let mut app = app_with("alpha alpine al");
+        place_cursor(&mut app, 0, 15); // end of the trailing "al"
+        trigger_completion(&mut app);
+        let comp = app.completion.as_ref().expect("popup should open");
+        assert_eq!(comp.candidates, vec!["alpha".to_string(), "alpine".to_string()]);
+        assert_eq!(comp.selected, 0);
+    }
+
+    #[test]
+    fn completion_does_not_open_without_matches() {
+        let mut app = app_with("alpha beta");
+        place_cursor(&mut app, 0, 10); // after "beta", but it's the only word
+        trigger_completion(&mut app);
+        assert!(app.completion.is_none());
+        assert_eq!(app.buffers[0].line_text(0), "alpha beta");
+    }
+
+    #[test]
+    fn accept_replaces_prefix_and_positions_cursor() {
+        let mut app = app_with("alpha al");
+        place_cursor(&mut app, 0, 8); // end of trailing "al"
+        trigger_completion(&mut app);
+        assert!(app.completion.is_some());
+        app.on_key(press(KeyCode::Enter, KeyModifiers::NONE)); // accept "alpha"
+        assert_eq!(app.buffers[0].line_text(0), "alpha alpha");
+        assert!(app.completion.is_none());
+        // cursor sits at the end of the inserted word
+        assert_eq!((app.panes[0].cursor.line, app.panes[0].cursor.col), (0, 11));
+    }
+
+    #[test]
+    fn tab_accepts_and_does_not_insert_spaces() {
+        let mut app = app_with("alpha al");
+        place_cursor(&mut app, 0, 8);
+        trigger_completion(&mut app);
+        app.on_key(press(KeyCode::Tab, KeyModifiers::NONE)); // accept, not 4 spaces
+        assert_eq!(app.buffers[0].line_text(0), "alpha alpha");
+        assert!(app.completion.is_none());
+    }
+
+    #[test]
+    fn enter_accepts_and_does_not_insert_newline() {
+        let mut app = app_with("alpha al");
+        place_cursor(&mut app, 0, 8);
+        trigger_completion(&mut app);
+        app.on_key(press(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.buffers[0].line_count(), 1); // no newline inserted
+        assert_eq!(app.buffers[0].line_text(0), "alpha alpha");
+    }
+
+    #[test]
+    fn dismiss_leaves_buffer_unchanged() {
+        let mut app = app_with("alpha al");
+        place_cursor(&mut app, 0, 8);
+        trigger_completion(&mut app);
+        app.on_key(press(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.completion.is_none());
+        assert_eq!(app.buffers[0].line_text(0), "alpha al");
+    }
+
+    #[test]
+    fn typing_narrows_and_backspace_widens_the_list() {
+        let mut app = app_with("apple apricot ax ap");
+        place_cursor(&mut app, 0, 19); // end of trailing "ap"
+        trigger_completion(&mut app);
+        assert_eq!(
+            app.completion.as_ref().unwrap().candidates,
+            vec!["apple".to_string(), "apricot".to_string()]
+        );
+        // type "p" -> prefix "app" -> only apple matches
+        app.on_key(press(KeyCode::Char('p'), KeyModifiers::NONE));
+        assert_eq!(
+            app.completion.as_ref().unwrap().candidates,
+            vec!["apple".to_string()]
+        );
+        // backspace -> prefix "ap" again -> both return
+        app.on_key(press(KeyCode::Backspace, KeyModifiers::NONE));
+        assert_eq!(
+            app.completion.as_ref().unwrap().candidates,
+            vec!["apple".to_string(), "apricot".to_string()]
+        );
+    }
+
+    #[test]
+    fn completion_closes_when_prefix_stops_matching() {
+        let mut app = app_with("apple ap");
+        place_cursor(&mut app, 0, 8);
+        trigger_completion(&mut app);
+        assert!(app.completion.is_some());
+        // type "z" -> prefix "apz" matches nothing -> popup closes
+        app.on_key(press(KeyCode::Char('z'), KeyModifiers::NONE));
+        assert!(app.completion.is_none());
+        assert_eq!(app.buffers[0].line_text(0), "apple apz"); // edit still applied
+    }
+
+    #[test]
+    fn completion_closes_when_cursor_leaves_the_word() {
+        let mut app = app_with("alpha al");
+        place_cursor(&mut app, 0, 8);
+        trigger_completion(&mut app);
+        assert!(app.completion.is_some());
+        // moving left within the word is fine, but moving before the prefix
+        // start closes it; here move left twice to leave the "al".
+        app.on_key(press(KeyCode::Left, KeyModifiers::NONE));
+        app.on_key(press(KeyCode::Left, KeyModifiers::NONE));
+        assert!(app.completion.is_none());
+    }
+
+    #[test]
+    fn moving_selection_changes_the_accepted_word() {
+        let mut app = app_with("alpha alpine al");
+        place_cursor(&mut app, 0, 15);
+        trigger_completion(&mut app);
+        app.on_key(press(KeyCode::Down, KeyModifiers::NONE)); // select "alpine"
+        app.on_key(press(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.buffers[0].line_text(0), "alpha alpine alpine");
     }
 }

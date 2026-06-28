@@ -1,5 +1,6 @@
 mod app;
 mod buffer;
+mod complete;
 mod diff_view;
 mod file_tree;
 mod git;

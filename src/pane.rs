@@ -57,6 +57,9 @@ pub struct EditorPane {
     last_height: usize,
     /// Incremental-search state, present only while a search prompt is open.
     search: Option<SearchState>,
+    /// Screen `(x, y)` of the hardware cursor at the last render, used to anchor
+    /// the completion popup to the cursor. `None` before the first focused render.
+    cursor_screen: Option<(u16, u16)>,
 }
 
 impl EditorPane {
@@ -69,6 +72,7 @@ impl EditorPane {
             scroll_col: 0,
             last_height: 0,
             search: None,
+            cursor_screen: None,
         }
     }
 
@@ -80,12 +84,19 @@ impl EditorPane {
         self.scroll_row = 0;
         self.scroll_col = 0;
         self.search = None;
+        self.cursor_screen = None;
     }
 
     // --- queries -----------------------------------------------------------
 
     pub fn has_selection(&self) -> bool {
         self.anchor.is_some()
+    }
+
+    /// Screen `(x, y)` of the cursor at the last focused render, for anchoring
+    /// the completion popup. `None` before the pane has rendered focused.
+    pub fn cursor_screen(&self) -> Option<(u16, u16)> {
+        self.cursor_screen
     }
 
     fn last_line(&self, buffer: &Buffer) -> usize {
@@ -410,6 +421,28 @@ impl EditorPane {
         self.anchor = None;
     }
 
+    // --- autocomplete ------------------------------------------------------
+
+    /// Accept a completion: replace the word-prefix spanning from `prefix_start`
+    /// to the cursor with `word`, leaving the cursor at the end of the inserted
+    /// word. The swap is a single undo step.
+    pub fn complete_accept(&mut self, buffer: &mut Buffer, prefix_start: (usize, usize), word: &str) {
+        let start = buffer.char_idx(prefix_start.0, prefix_start.1);
+        let end = buffer.char_idx(self.cursor.line, self.cursor.col);
+        buffer.finalize();
+        buffer.begin_edit(start);
+        if start < end {
+            buffer.remove(start, end);
+        }
+        buffer.insert(start, word);
+        buffer.finalize();
+        let (line, col) = buffer.line_col(start + word.chars().count());
+        self.cursor.line = line;
+        self.cursor.col = col;
+        self.cursor.target_col = col;
+        self.anchor = None;
+    }
+
     // --- rendering ---------------------------------------------------------
 
     /// Render this pane into `area`: the buffer's visible region plus a
@@ -525,6 +558,9 @@ impl EditorPane {
             let cx = content.x + (self.cursor.col.saturating_sub(self.scroll_col)) as u16;
             let cy = content.y + (self.cursor.line.saturating_sub(self.scroll_row)) as u16;
             frame.set_cursor_position((cx, cy));
+            self.cursor_screen = Some((cx, cy));
+        } else {
+            self.cursor_screen = None;
         }
     }
 
