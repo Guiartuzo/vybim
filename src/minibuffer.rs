@@ -14,6 +14,7 @@ use ratatui::widgets::Paragraph;
 pub enum MiniMode {
     Search,
     GotoLine,
+    Files,
 }
 
 #[derive(Debug)]
@@ -39,6 +40,14 @@ impl Minibuffer {
             prompt: "Go to line: ".to_string(),
             input: String::new(),
             mode: MiniMode::GotoLine,
+        }
+    }
+
+    pub fn files() -> Self {
+        Self {
+            prompt: "> ".to_string(),
+            input: String::new(),
+            mode: MiniMode::Files,
         }
     }
 

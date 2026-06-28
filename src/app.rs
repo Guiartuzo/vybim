@@ -9,7 +9,7 @@
 //! without the main loop busy-spinning.
 
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Sender};
 use std::thread;
 
@@ -23,6 +23,7 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use crate::buffer::Buffer;
 use crate::complete::{Completion, MAX_CANDIDATES};
 use crate::diff_view::DiffView;
+use crate::file_find::{self, FileItem};
 use crate::file_tree::FileTree;
 use crate::minibuffer::{MiniMode, Minibuffer};
 use crate::pane::EditorPane;
@@ -69,6 +70,7 @@ const BINDINGS: &[KeyBinding] = &[
     KeyBinding { group: "Editor", keys: "Ctrl+Y", action: "Redo", footer: None },
     KeyBinding { group: "Editor", keys: "Ctrl+F", action: "Find", footer: Some("find") },
     KeyBinding { group: "Editor", keys: "Ctrl+G", action: "Go to line", footer: None },
+    KeyBinding { group: "Editor", keys: "Ctrl+P", action: "Fuzzy file finder", footer: Some("open") },
     KeyBinding { group: "Editor", keys: "Ctrl+N", action: "Autocomplete word (Ctrl+Space alias)", footer: Some("complete") },
     KeyBinding { group: "Editor", keys: "Up / Down", action: "Completion: previous / next", footer: None },
     KeyBinding { group: "Editor", keys: "Tab / Enter", action: "Completion: accept", footer: None },
@@ -80,6 +82,9 @@ const BINDINGS: &[KeyBinding] = &[
     KeyBinding { group: "Terminal", keys: "Ctrl+T", action: "New terminal", footer: None },
     KeyBinding { group: "Terminal", keys: "Ctrl+PageUp / PageDown", action: "Switch terminal", footer: None },
     KeyBinding { group: "Terminal", keys: "Ctrl+W", action: "Close terminal", footer: None },
+    KeyBinding { group: "File finder", keys: "Up / Down", action: "Move selection", footer: None },
+    KeyBinding { group: "File finder", keys: "Enter", action: "Open selected file", footer: None },
+    KeyBinding { group: "File finder", keys: "Esc", action: "Dismiss", footer: None },
     KeyBinding { group: "Sidebar", keys: "Up / Down", action: "Move selection", footer: None },
     KeyBinding { group: "Sidebar", keys: "Left / Right", action: "Collapse / expand directory", footer: None },
     KeyBinding { group: "Sidebar", keys: "Enter", action: "Open file / toggle directory", footer: None },
@@ -109,6 +114,55 @@ enum Focus {
     Diff,
 }
 
+/// State of the open fuzzy file-finder: the file snapshot taken when the prompt
+/// opened, the indices (into `items`) of the entries matching the current query,
+/// and which match is selected. Filtering happens in memory against the snapshot
+/// — the tree is walked once, never per keystroke.
+#[derive(Debug)]
+struct FileFinder {
+    items: Vec<FileItem>,
+    matches: Vec<usize>,
+    selected: usize,
+}
+
+impl FileFinder {
+    /// Snapshot `root`'s files and seed the (empty-query) match list.
+    fn open(root: &Path) -> Self {
+        let items = file_find::gather_files(root);
+        let matches = file_find::rank(&items, "");
+        Self {
+            items,
+            matches,
+            selected: 0,
+        }
+    }
+
+    /// Re-rank the snapshot against `query`, resetting the selection to the top.
+    fn rerank(&mut self, query: &str) {
+        self.matches = file_find::rank(&self.items, query);
+        self.selected = 0;
+    }
+
+    /// Move the selection down one match (clamped to the last).
+    fn move_down(&mut self) {
+        if self.selected + 1 < self.matches.len() {
+            self.selected += 1;
+        }
+    }
+
+    /// Move the selection up one match (clamped to the first).
+    fn move_up(&mut self) {
+        self.selected = self.selected.saturating_sub(1);
+    }
+
+    /// The path of the selected match, or `None` when nothing matches.
+    fn selected_path(&self) -> Option<PathBuf> {
+        self.matches
+            .get(self.selected)
+            .map(|&i| self.items[i].path.clone())
+    }
+}
+
 /// Central application state — the single owner of everything NyxVim tracks.
 #[derive(Debug)]
 pub struct App {
@@ -125,8 +179,10 @@ pub struct App {
     focused: usize,
     /// The docked terminal area: multiple terminals, toggled as one unit.
     terminal_area: TerminalArea,
-    /// The active minibuffer prompt (search / go-to-line), if any.
+    /// The active minibuffer prompt (search / go-to-line / file-finder), if any.
     minibuffer: Option<Minibuffer>,
+    /// The open fuzzy file-finder, paired with a `Minibuffer::files()` prompt.
+    file_finder: Option<FileFinder>,
     /// The diff view, if open. While `Some` it claims the body and captures
     /// input (read-only — it never edits a buffer).
     diff: Option<DiffView>,
@@ -134,6 +190,8 @@ pub struct App {
     /// only navigate/accept/dismiss keys; other keys edit and re-query it.
     completion: Option<Completion>,
     tree: FileTree,
+    /// The workspace root, snapshotted by the fuzzy file-finder.
+    root: PathBuf,
     focus: Focus,
     /// Sender for spawning terminal panes; set once the loop starts.
     event_tx: Option<Sender<AppEvent>>,
@@ -149,6 +207,7 @@ impl App {
     /// Start with a single pane viewing `buffer` and a sidebar rooted at `root`.
     pub fn new(buffer: Buffer, root: impl AsRef<std::path::Path>) -> Self {
         let syntax = buffer.path().and_then(Syntax::for_path);
+        let root = root.as_ref().to_path_buf();
         Self {
             should_quit: false,
             buffers: vec![buffer],
@@ -157,9 +216,11 @@ impl App {
             focused: 0,
             terminal_area: TerminalArea::new(),
             minibuffer: None,
+            file_finder: None,
             diff: None,
             completion: None,
-            tree: FileTree::new(root),
+            tree: FileTree::new(&root),
+            root,
             focus: Focus::Editor,
             event_tx: None,
             next_terminal_id: 0,
@@ -296,6 +357,11 @@ impl App {
         // The minibuffer prompt takes over the bottom row while open, and owns
         // the hardware cursor (the focused pane suppresses its own cursor then).
         if let Some(mini) = &self.minibuffer {
+            // The fuzzy file-finder draws its ranked results just above the
+            // prompt row before the prompt itself takes the bottom line.
+            if let Some(ff) = &self.file_finder {
+                render_file_finder_results(frame, footer, ff);
+            }
             let cx = mini.render(frame, footer);
             frame.set_cursor_position((cx, footer.y));
         } else {
@@ -433,6 +499,7 @@ impl App {
             KeyCode::Char('w') if ctrl => return self.close_focused_pane(),
             KeyCode::Char('f') if ctrl => return self.open_search(),
             KeyCode::Char('g') if ctrl => return self.open_goto_line(),
+            KeyCode::Char('p') if ctrl => return self.open_file_finder(),
             KeyCode::Left if alt => return self.focus_prev(),
             KeyCode::Right if alt => return self.focus_next(),
             // Autocomplete trigger: `Ctrl+N` (reliable) plus a best-effort
@@ -618,6 +685,15 @@ impl App {
         self.focus = Focus::Minibuffer;
     }
 
+    /// Open the fuzzy file-finder: snapshot the workspace's files and show the
+    /// finder prompt. Typing filters the snapshot; Enter opens the selection.
+    fn open_file_finder(&mut self) {
+        self.completion = None;
+        self.file_finder = Some(FileFinder::open(&self.root));
+        self.minibuffer = Some(Minibuffer::files());
+        self.focus = Focus::Minibuffer;
+    }
+
     /// Handle a key while the minibuffer prompt is open. Enter commits, Esc
     /// cancels; everything else edits the input (and, in search mode, drives
     /// incremental matching and next/previous navigation).
@@ -648,6 +724,25 @@ impl App {
             }
         }
 
+        // File-finder-only navigation over the ranked results.
+        if mode == Some(MiniMode::Files) {
+            match key.code {
+                KeyCode::Down => {
+                    if let Some(ff) = self.file_finder.as_mut() {
+                        ff.move_down();
+                    }
+                    return;
+                }
+                KeyCode::Up => {
+                    if let Some(ff) = self.file_finder.as_mut() {
+                        ff.move_up();
+                    }
+                    return;
+                }
+                _ => {}
+            }
+        }
+
         if let KeyCode::Char(c) = key.code
             && !ctrl
             && !alt
@@ -666,14 +761,25 @@ impl App {
     /// Re-run incremental search against the focused pane after the query
     /// changed. No-op for go-to-line, which acts only on commit.
     fn minibuffer_input_changed(&mut self) {
-        let Some(m) = self.minibuffer.as_ref() else {
+        let Some((mode, query)) = self
+            .minibuffer
+            .as_ref()
+            .map(|m| (m.mode, m.input.clone()))
+        else {
             return;
         };
-        if m.mode == MiniMode::Search {
-            let query = m.input.clone();
-            let ed = &mut self.panes[self.focused];
-            let buffer = &self.buffers[ed.buffer_id];
-            ed.search_update(buffer, &query);
+        match mode {
+            MiniMode::Search => {
+                let ed = &mut self.panes[self.focused];
+                let buffer = &self.buffers[ed.buffer_id];
+                ed.search_update(buffer, &query);
+            }
+            MiniMode::Files => {
+                if let Some(ff) = self.file_finder.as_mut() {
+                    ff.rerank(&query);
+                }
+            }
+            MiniMode::GotoLine => {}
         }
     }
 
@@ -691,8 +797,17 @@ impl App {
                         ed.goto_line(buffer, n);
                     }
                 }
+                MiniMode::Files => {
+                    // Open the selected file (a no-op when nothing matched).
+                    if let Some(path) =
+                        self.file_finder.as_ref().and_then(FileFinder::selected_path)
+                    {
+                        self.open_in_focused_pane(path);
+                    }
+                }
             }
         }
+        self.file_finder = None;
         self.focus = Focus::Editor;
     }
 
@@ -703,6 +818,7 @@ impl App {
         {
             self.panes[self.focused].search_cancel();
         }
+        self.file_finder = None;
         self.focus = Focus::Editor;
     }
 
@@ -940,6 +1056,60 @@ fn render_completion_popup(frame: &mut Frame, anchor: (u16, u16), comp: &Complet
                 Style::new().fg(Color::Gray)
             };
             Line::styled(cand.clone(), style)
+        })
+        .collect();
+
+    let block = Block::new()
+        .borders(Borders::ALL)
+        .border_style(Style::new().fg(Color::DarkGray));
+    let area = Rect::new(x, y, w, h);
+    frame.render_widget(Clear, area);
+    frame.render_widget(Paragraph::new(Text::from(lines)).block(block), area);
+}
+
+/// Maximum result rows the file-finder list shows at once.
+const MAX_FINDER_ROWS: usize = 10;
+
+/// Draw the file-finder's ranked results as a bordered list sitting directly
+/// above `prompt_row` (the bottom prompt line), left-aligned. A scrolling window
+/// keeps the selected row visible; the selection is highlighted. Draws nothing
+/// when there are no matches (the prompt row alone then shows the empty query).
+fn render_file_finder_results(frame: &mut Frame, prompt_row: Rect, ff: &FileFinder) {
+    let screen = frame.area();
+    let total = ff.matches.len();
+    let rows = total.min(MAX_FINDER_ROWS);
+    if rows == 0 {
+        return;
+    }
+
+    // Window the list so the selected row is always visible, even far down.
+    let start = ff.selected.saturating_sub(rows - 1);
+    let end = (start + rows).min(total);
+    let window: Vec<(usize, &str)> = ff.matches[start..end]
+        .iter()
+        .enumerate()
+        .map(|(row, &item_idx)| (start + row, ff.items[item_idx].display.as_str()))
+        .collect();
+
+    let longest = window
+        .iter()
+        .map(|(_, d)| d.chars().count())
+        .max()
+        .unwrap_or(0);
+    let w = ((longest as u16).saturating_add(2)).min(screen.width).max(1);
+    let h = ((rows as u16).saturating_add(2)).min(screen.height).max(1);
+    let y = prompt_row.y.saturating_sub(h);
+    let x = screen.x;
+
+    let lines: Vec<Line> = window
+        .iter()
+        .map(|(idx, display)| {
+            let style = if *idx == ff.selected {
+                Style::new().bg(Color::Blue).fg(Color::White)
+            } else {
+                Style::new().fg(Color::Gray)
+            };
+            Line::styled((*display).to_string(), style)
         })
         .collect();
 
@@ -1466,5 +1636,84 @@ mod tests {
         app.on_key(press(KeyCode::Down, KeyModifiers::NONE)); // select "alpine"
         app.on_key(press(KeyCode::Enter, KeyModifiers::NONE));
         assert_eq!(app.buffers[0].line_text(0), "alpha alpine alpine");
+    }
+
+    // --- fuzzy file finder -------------------------------------------------
+
+    /// An app rooted at a fresh temp fixture holding `src/main.rs` and
+    /// `README.md`. Returns the app and its root (caller removes it).
+    fn fixture_app(tag: &str) -> (App, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("nyxvim_finder_{}_{tag}", std::process::id()));
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("src/main.rs"), "fn main() {}").unwrap();
+        std::fs::write(dir.join("README.md"), "# hi").unwrap();
+        let app = App::new(Buffer::from_str(""), &dir);
+        (app, dir)
+    }
+
+    #[test]
+    fn ctrl_p_opens_finder_and_esc_closes_it_opening_nothing() {
+        let (mut app, dir) = fixture_app("open");
+        let before = app.buffers.len();
+        app.on_key(press(KeyCode::Char('p'), KeyModifiers::CONTROL));
+        assert_eq!(app.focus, Focus::Minibuffer);
+        assert!(app.file_finder.is_some());
+        app.on_key(press(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(app.focus, Focus::Editor);
+        assert!(app.file_finder.is_none());
+        assert!(app.minibuffer.is_none());
+        assert_eq!(app.buffers.len(), before); // opened nothing
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn typing_narrows_and_enter_opens_the_matched_file() {
+        let (mut app, dir) = fixture_app("open_file");
+        app.on_key(press(KeyCode::Char('p'), KeyModifiers::CONTROL));
+        for c in "main".chars() {
+            app.on_key(press(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        // only src/main.rs matches "main"
+        assert_eq!(app.file_finder.as_ref().unwrap().matches.len(), 1);
+        let before = app.buffers.len();
+        app.on_key(press(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.focus, Focus::Editor);
+        assert!(app.file_finder.is_none());
+        assert_eq!(app.buffers.len(), before + 1);
+        let id = buffer_id_at(&app, app.focused);
+        assert_eq!(app.buffers[id].line_text(0), "fn main() {}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn enter_with_no_match_opens_nothing() {
+        let (mut app, dir) = fixture_app("nomatch");
+        app.on_key(press(KeyCode::Char('p'), KeyModifiers::CONTROL));
+        for c in "zzzzz".chars() {
+            app.on_key(press(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        assert!(app.file_finder.as_ref().unwrap().matches.is_empty());
+        let before = app.buffers.len();
+        app.on_key(press(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.buffers.len(), before);
+        assert_eq!(app.focus, Focus::Editor);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn up_down_move_the_finder_selection() {
+        let (mut app, dir) = fixture_app("nav");
+        app.on_key(press(KeyCode::Char('p'), KeyModifiers::CONTROL));
+        // empty query: both fixture files match, in snapshot order
+        assert!(app.file_finder.as_ref().unwrap().matches.len() >= 2);
+        assert_eq!(app.file_finder.as_ref().unwrap().selected, 0);
+        app.on_key(press(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(app.file_finder.as_ref().unwrap().selected, 1);
+        app.on_key(press(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(app.file_finder.as_ref().unwrap().selected, 0);
+        // up at the top clamps (does not wrap)
+        app.on_key(press(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(app.file_finder.as_ref().unwrap().selected, 0);
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

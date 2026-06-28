@@ -2,6 +2,7 @@ mod app;
 mod buffer;
 mod complete;
 mod diff_view;
+mod file_find;
 mod file_tree;
 mod git;
 mod minibuffer;
