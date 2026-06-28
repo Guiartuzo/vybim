@@ -25,10 +25,15 @@ use crate::file_tree::FileTree;
 use crate::pane::EditorPane;
 use crate::syntax::Syntax;
 use crate::terminal::Tui;
+use crate::terminal_area::TerminalArea;
 use crate::terminal_pane::TerminalPane;
 
 /// Width of the file-tree sidebar, in columns.
 const SIDEBAR_WIDTH: u16 = 28;
+
+/// Width of the docked terminal area, in columns. Fixed in v1 (resize is a
+/// deliberate non-goal); the PTY resizes to whatever width it is given.
+const TERMINAL_AREA_WIDTH: u16 = 60;
 
 /// One keybinding, the single source of truth for both the footer hint and the
 /// help overlay (so they can't drift). `footer` holds a terse label when the
@@ -45,6 +50,7 @@ struct KeyBinding {
 const BINDINGS: &[KeyBinding] = &[
     KeyBinding { group: "Global", keys: "Ctrl+Q", action: "Quit", footer: Some("quit") },
     KeyBinding { group: "Global", keys: "Ctrl+B", action: "Show / hide sidebar", footer: Some("sidebar") },
+    KeyBinding { group: "Global", keys: "Ctrl+J", action: "Show / hide terminal", footer: Some("term") },
     KeyBinding { group: "Global", keys: "F1", action: "Toggle this help", footer: Some("help") },
     KeyBinding { group: "Editor", keys: "Arrows", action: "Move cursor", footer: None },
     KeyBinding { group: "Editor", keys: "Shift+move", action: "Extend selection", footer: None },
@@ -53,9 +59,11 @@ const BINDINGS: &[KeyBinding] = &[
     KeyBinding { group: "Editor", keys: "Ctrl+S", action: "Save", footer: Some("save") },
     KeyBinding { group: "Editor", keys: "Ctrl+E", action: "Split pane vertically", footer: Some("split") },
     KeyBinding { group: "Editor", keys: "Ctrl+\\", action: "Split pane (alias)", footer: None },
-    KeyBinding { group: "Editor", keys: "Ctrl+T", action: "Open terminal", footer: Some("term") },
     KeyBinding { group: "Editor", keys: "Ctrl+W", action: "Close pane", footer: Some("close") },
     KeyBinding { group: "Editor", keys: "Alt+Left / Alt+Right", action: "Move focus between panes", footer: None },
+    KeyBinding { group: "Terminal", keys: "Ctrl+T", action: "New terminal", footer: None },
+    KeyBinding { group: "Terminal", keys: "Ctrl+PageUp / PageDown", action: "Switch terminal", footer: None },
+    KeyBinding { group: "Terminal", keys: "Ctrl+W", action: "Close terminal", footer: None },
     KeyBinding { group: "Sidebar", keys: "Up / Down", action: "Move selection", footer: None },
     KeyBinding { group: "Sidebar", keys: "Left / Right", action: "Collapse / expand directory", footer: None },
     KeyBinding { group: "Sidebar", keys: "Enter", action: "Open file / toggle directory", footer: None },
@@ -74,14 +82,7 @@ pub enum AppEvent {
 enum Focus {
     Sidebar,
     Editor,
-}
-
-/// A pane in the editor area: a text editor or an integrated terminal.
-/// The terminal is boxed because it is much larger than an editor pane.
-#[derive(Debug)]
-enum Pane {
-    Editor(EditorPane),
-    Terminal(Box<TerminalPane>),
+    Terminal,
 }
 
 /// Central application state — the single owner of everything NyxVim tracks.
@@ -93,10 +94,13 @@ pub struct App {
     /// Per-buffer highlighter (parallel to `buffers`); `None` when the buffer's
     /// language has no bundled grammar.
     syntaxes: Vec<Option<Syntax>>,
-    /// Side-by-side panes (vertical splits).
-    panes: Vec<Pane>,
-    /// Index into `panes` of the pane receiving input.
+    /// Side-by-side editor panes (vertical splits). The terminal is no longer a
+    /// peer here — it lives in `terminal_area`.
+    panes: Vec<EditorPane>,
+    /// Index into `panes` of the editor pane receiving input.
     focused: usize,
+    /// The docked terminal area: multiple terminals, toggled as one unit.
+    terminal_area: TerminalArea,
     tree: FileTree,
     focus: Focus,
     /// Sender for spawning terminal panes; set once the loop starts.
@@ -117,8 +121,9 @@ impl App {
             should_quit: false,
             buffers: vec![buffer],
             syntaxes: vec![syntax],
-            panes: vec![Pane::Editor(EditorPane::new(0))],
+            panes: vec![EditorPane::new(0)],
             focused: 0,
+            terminal_area: TerminalArea::new(),
             tree: FileTree::new(root),
             focus: Focus::Editor,
             event_tx: None,
@@ -177,22 +182,42 @@ impl App {
         let [body, footer] =
             Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(frame.area());
 
-        // Sidebar on the left when visible; otherwise the pane area fills the
+        // Sidebar on the left when visible; otherwise the main area fills the
         // whole body.
-        let pane_area = if self.sidebar_visible {
-            let [sidebar, pane_area] =
+        let main = if self.sidebar_visible {
+            let [sidebar, main] =
                 Layout::horizontal([Constraint::Length(SIDEBAR_WIDTH), Constraint::Fill(1)])
                     .areas(body);
             self.tree
                 .render(frame, sidebar, self.focus == Focus::Sidebar);
-            pane_area
+            main
         } else {
             body
         };
 
-        // Divide the pane area across panes, with a 1-column divider between
-        // adjacent panes. Pane i lives at regions[i*2]; its divider (if any) at
-        // regions[i*2 + 1].
+        // Terminal area docked on the right when visible, separated from the
+        // editors by a thin divider (the same style as inter-pane dividers).
+        let pane_area = if self.terminal_area.is_visible() {
+            let [editors, divider, term] = Layout::horizontal([
+                Constraint::Fill(1),
+                Constraint::Length(1),
+                Constraint::Length(TERMINAL_AREA_WIDTH),
+            ])
+            .areas(main);
+            let div = Block::new()
+                .borders(Borders::LEFT)
+                .border_style(Style::new().fg(Color::DarkGray));
+            frame.render_widget(div, divider);
+            self.terminal_area
+                .render(frame, term, self.focus == Focus::Terminal);
+            editors
+        } else {
+            main
+        };
+
+        // Divide the pane area across editor panes, with a 1-column divider
+        // between adjacent panes. Pane i lives at regions[i*2]; its divider (if
+        // any) at regions[i*2 + 1].
         let n = self.panes.len();
         let mut constraints = Vec::with_capacity(n * 2);
         for i in 0..n {
@@ -202,17 +227,12 @@ impl App {
             }
         }
         let regions = Layout::horizontal(constraints).split(pane_area);
-        for (i, pane) in self.panes.iter_mut().enumerate() {
+        for (i, ed) in self.panes.iter_mut().enumerate() {
             let region = regions[i * 2];
             let focused = self.focus == Focus::Editor && i == self.focused;
-            match pane {
-                Pane::Editor(ed) => {
-                    let buffer = &self.buffers[ed.buffer_id];
-                    let syntax = self.syntaxes[ed.buffer_id].as_ref();
-                    ed.render(frame, region, buffer, syntax, focused);
-                }
-                Pane::Terminal(term) => term.render(frame, region, focused),
-            }
+            let buffer = &self.buffers[ed.buffer_id];
+            let syntax = self.syntaxes[ed.buffer_id].as_ref();
+            ed.render(frame, region, buffer, syntax, focused);
         }
         // Thin vertical lines between panes.
         for i in 0..n.saturating_sub(1) {
@@ -256,12 +276,17 @@ impl App {
                 self.toggle_sidebar();
                 return;
             }
+            KeyCode::Char('j') if ctrl => {
+                self.toggle_terminal_area();
+                return;
+            }
             _ => {}
         }
 
         match self.focus {
             Focus::Sidebar => self.on_sidebar_key(key),
             Focus::Editor => self.on_pane_key(key),
+            Focus::Terminal => self.on_terminal_key(key),
         }
     }
 
@@ -293,19 +318,33 @@ impl App {
             // a secondary alias.
             KeyCode::Char('e') if ctrl => return self.split_vertical(),
             KeyCode::Char('\\') if ctrl => return self.split_vertical(),
-            KeyCode::Char('t') if ctrl => return self.open_terminal(),
+            KeyCode::Char('t') if ctrl => return self.spawn_terminal(),
             KeyCode::Char('w') if ctrl => return self.close_focused_pane(),
             KeyCode::Left if alt => return self.focus_prev(),
             KeyCode::Right if alt => return self.focus_next(),
             _ => {}
         }
 
-        match &mut self.panes[self.focused] {
-            Pane::Editor(ed) => {
-                let buffer = &mut self.buffers[ed.buffer_id];
-                dispatch_editor(ed, buffer, key);
-            }
-            Pane::Terminal(term) => term.send_key(key),
+        let ed = &mut self.panes[self.focused];
+        let buffer = &mut self.buffers[ed.buffer_id];
+        dispatch_editor(ed, buffer, key);
+    }
+
+    /// Keys while the terminal area is focused: area-management chords (new,
+    /// cycle, close), otherwise forwarded to the active terminal's shell.
+    fn on_terminal_key(&mut self, key: KeyEvent) {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+
+        match key.code {
+            KeyCode::Char('t') if ctrl => return self.spawn_terminal(),
+            KeyCode::Char('w') if ctrl => return self.close_active_terminal(),
+            KeyCode::PageUp if ctrl => return self.terminal_area.cycle_prev(),
+            KeyCode::PageDown if ctrl => return self.terminal_area.cycle_next(),
+            _ => {}
+        }
+
+        if let Some(term) = self.terminal_area.active_mut() {
+            term.send_key(key);
         }
     }
 
@@ -329,11 +368,7 @@ impl App {
             let id = self.buffers.len();
             self.buffers.push(buffer);
             self.syntaxes.push(syntax);
-            match &mut self.panes[self.focused] {
-                Pane::Editor(ed) => ed.set_buffer(id),
-                // Opening a file replaces a focused terminal with an editor.
-                pane => *pane = Pane::Editor(EditorPane::new(id)),
-            }
+            self.panes[self.focused].set_buffer(id);
             self.focus = Focus::Editor;
         }
     }
@@ -341,30 +376,14 @@ impl App {
     // --- pane management ---------------------------------------------------
 
     /// Split the focused editor pane, placing a new pane viewing the same
-    /// buffer beside it. No-op when a terminal is focused.
+    /// buffer beside it.
     fn split_vertical(&mut self) {
-        if let Pane::Editor(ed) = &self.panes[self.focused] {
-            let new_pane = Pane::Editor(EditorPane::new(ed.buffer_id));
-            self.panes.insert(self.focused + 1, new_pane);
-            self.focused += 1;
-        }
+        let buffer_id = self.panes[self.focused].buffer_id;
+        self.panes.insert(self.focused + 1, EditorPane::new(buffer_id));
+        self.focused += 1;
     }
 
-    /// Open a new integrated terminal pane beside the focused one.
-    fn open_terminal(&mut self) {
-        let Some(tx) = self.event_tx.clone() else {
-            return;
-        };
-        let id = self.next_terminal_id;
-        if let Ok(term) = TerminalPane::spawn(id, tx) {
-            self.next_terminal_id += 1;
-            self.panes
-                .insert(self.focused + 1, Pane::Terminal(Box::new(term)));
-            self.focused += 1;
-        }
-    }
-
-    /// Close the focused pane, unless it is the last one.
+    /// Close the focused editor pane, unless it is the last one.
     fn close_focused_pane(&mut self) {
         if self.panes.len() <= 1 {
             return;
@@ -373,28 +392,59 @@ impl App {
         self.clamp_focus();
     }
 
-    /// Deliver shell output to the matching terminal pane.
-    fn feed_terminal(&mut self, id: usize, bytes: &[u8]) {
-        for pane in &mut self.panes {
-            if let Pane::Terminal(term) = pane
-                && term.id == id
-            {
-                term.process(bytes);
-                return;
-            }
+    // --- terminal area -----------------------------------------------------
+
+    /// Show or hide the whole terminal area without killing any shell. Showing
+    /// it focuses the terminal (spawning a first one if the area is empty);
+    /// hiding it returns focus to the editor.
+    fn toggle_terminal_area(&mut self) {
+        if self.terminal_area.is_visible() {
+            self.terminal_area.hide();
+            self.focus = Focus::Editor;
+        } else if self.terminal_area.is_empty() {
+            // Nothing to show yet — opening the area creates its first terminal.
+            self.spawn_terminal();
+        } else {
+            self.terminal_area.show();
+            self.focus = Focus::Terminal;
         }
     }
 
-    /// A terminal's shell exited: remove its pane, keeping at least one pane.
+    /// Spawn a new terminal into the area, make it active, show the area, and
+    /// move focus into it.
+    fn spawn_terminal(&mut self) {
+        let Some(tx) = self.event_tx.clone() else {
+            return;
+        };
+        let id = self.next_terminal_id;
+        if let Ok(term) = TerminalPane::spawn(id, tx) {
+            self.next_terminal_id += 1;
+            self.terminal_area.add(term);
+            self.focus = Focus::Terminal;
+        }
+    }
+
+    /// Close the active terminal; if it was the last one the area hides itself,
+    /// so return focus to the editor.
+    fn close_active_terminal(&mut self) {
+        if self.terminal_area.close_active() {
+            self.focus = Focus::Editor;
+        }
+    }
+
+    /// Deliver shell output to the matching terminal, even when the area is
+    /// hidden — its grid stays current so showing it reveals up-to-date output.
+    fn feed_terminal(&mut self, id: usize, bytes: &[u8]) {
+        if let Some(term) = self.terminal_area.find_mut(id) {
+            term.process(bytes);
+        }
+    }
+
+    /// A terminal's shell exited: remove it from the area. If it was the last
+    /// one the area hides itself, so return focus to the editor.
     fn on_terminal_exit(&mut self, id: usize) {
-        if let Some(idx) = self.panes.iter().position(
-            |p| matches!(p, Pane::Terminal(t) if t.id == id),
-        ) {
-            self.panes.remove(idx);
-            if self.panes.is_empty() {
-                self.panes.push(Pane::Editor(EditorPane::new(0)));
-            }
-            self.clamp_focus();
+        if self.terminal_area.remove_by_id(id) && self.focus == Focus::Terminal {
+            self.focus = Focus::Editor;
         }
     }
 
@@ -516,12 +566,18 @@ mod tests {
         KeyEvent::new(code, modifiers)
     }
 
-    /// The buffer id of an editor pane (panics if it is a terminal).
+    /// The buffer id of editor pane `i`.
     fn buffer_id_at(app: &App, i: usize) -> usize {
-        match &app.panes[i] {
-            Pane::Editor(ed) => ed.buffer_id,
-            _ => panic!("pane {i} is not an editor"),
-        }
+        app.panes[i].buffer_id
+    }
+
+    /// Wire up an event sender so `spawn_terminal` can run (it spawns a real
+    /// shell, as the terminal-pane tests already do). The returned receiver must
+    /// be kept alive so the reader threads do not error out mid-test.
+    fn with_terminals(app: &mut App) -> std::sync::mpsc::Receiver<AppEvent> {
+        let (tx, rx) = mpsc::channel();
+        app.event_tx = Some(tx);
+        rx
     }
 
     #[test]
@@ -638,5 +694,77 @@ mod tests {
         // closing the last pane is a no-op
         app.close_focused_pane();
         assert_eq!(app.panes.len(), 1);
+    }
+
+    #[test]
+    fn ctrl_j_toggles_terminal_area_and_focus() {
+        let mut app = test_app();
+        let _rx = with_terminals(&mut app);
+        assert!(!app.terminal_area.is_visible());
+        // first toggle: empty area spawns a terminal, shows it, focuses terminal
+        app.on_key(press(KeyCode::Char('j'), KeyModifiers::CONTROL));
+        assert!(app.terminal_area.is_visible());
+        assert!(!app.terminal_area.is_empty());
+        assert_eq!(app.focus, Focus::Terminal);
+        // second toggle: hides the area (shell stays alive) and refocuses editor
+        app.on_key(press(KeyCode::Char('j'), KeyModifiers::CONTROL));
+        assert!(!app.terminal_area.is_visible());
+        assert!(!app.terminal_area.is_empty());
+        assert_eq!(app.focus, Focus::Editor);
+        // third toggle: non-empty area just shows again, no new terminal
+        app.on_key(press(KeyCode::Char('j'), KeyModifiers::CONTROL));
+        assert!(app.terminal_area.is_visible());
+        assert_eq!(app.focus, Focus::Terminal);
+    }
+
+    #[test]
+    fn ctrl_t_spawns_terminal_without_touching_editor_panes() {
+        let mut app = test_app();
+        let _rx = with_terminals(&mut app);
+        app.split_vertical(); // two editor panes, focused = 1
+        assert_eq!(app.panes.len(), 2);
+        app.on_key(press(KeyCode::Char('t'), KeyModifiers::CONTROL));
+        // editor panes are untouched; the terminal is the new focus
+        assert_eq!(app.panes.len(), 2);
+        assert_eq!(app.focused, 1);
+        assert!(app.terminal_area.is_visible());
+        assert_eq!(app.focus, Focus::Terminal);
+    }
+
+    #[test]
+    fn closing_last_terminal_hides_area_and_refocuses_editor() {
+        let mut app = test_app();
+        let _rx = with_terminals(&mut app);
+        app.spawn_terminal();
+        assert!(app.terminal_area.is_visible());
+        app.close_active_terminal();
+        assert!(!app.terminal_area.is_visible());
+        assert!(app.terminal_area.is_empty());
+        assert_eq!(app.focus, Focus::Editor);
+    }
+
+    #[test]
+    fn last_shell_exit_hides_area_and_refocuses_editor() {
+        let mut app = test_app();
+        let rx = with_terminals(&mut app);
+        app.spawn_terminal();
+        let id = app.next_terminal_id - 1;
+        app.on_terminal_exit(id);
+        assert!(!app.terminal_area.is_visible());
+        assert!(app.terminal_area.is_empty());
+        assert_eq!(app.focus, Focus::Editor);
+        drop(rx);
+    }
+
+    #[test]
+    fn toggling_terminal_leaves_editor_panes_unchanged() {
+        let mut app = test_app();
+        let _rx = with_terminals(&mut app);
+        app.split_vertical(); // two panes, focused = 1
+        let (n, focused) = (app.panes.len(), app.focused);
+        app.toggle_terminal_area(); // show (spawns first terminal)
+        app.toggle_terminal_area(); // hide
+        assert_eq!(app.panes.len(), n);
+        assert_eq!(app.focused, focused);
     }
 }
