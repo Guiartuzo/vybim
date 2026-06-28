@@ -16,7 +16,7 @@ use std::thread;
 use ratatui::Frame;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::{Color, Style};
+use ratatui::style::Style;
 use ratatui::text::{Line, Text};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 
@@ -31,6 +31,7 @@ use crate::syntax::Syntax;
 use crate::terminal::Tui;
 use crate::terminal_area::TerminalArea;
 use crate::terminal_pane::TerminalPane;
+use crate::theme::Theme;
 
 /// Width of the file-tree sidebar, in columns.
 const SIDEBAR_WIDTH: u16 = 28;
@@ -204,6 +205,8 @@ pub struct App {
     help_visible: bool,
     /// Whether the file-tree sidebar is shown.
     sidebar_visible: bool,
+    /// The UI color theme; the single source of truth for chrome colors.
+    theme: Theme,
 }
 
 impl App {
@@ -229,6 +232,7 @@ impl App {
             next_terminal_id: 0,
             help_visible: false,
             sidebar_visible: true,
+            theme: Theme::default(),
         }
     }
 
@@ -281,11 +285,15 @@ impl App {
         let [body, footer] =
             Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(frame.area());
 
+        // Copy the theme out so render code can borrow it freely while other
+        // parts of `self` are borrowed mutably (it is `Copy`).
+        let theme = self.theme;
+
         // The diff view is modal: while open it claims the whole body (the
         // footer still renders), so the editor layout below is skipped.
         if let Some(diff) = self.diff.as_mut() {
-            diff.render(frame, body);
-            render_footer(frame, footer);
+            diff.render(frame, body, &theme);
+            render_footer(frame, footer, &theme);
             return;
         }
 
@@ -296,7 +304,7 @@ impl App {
                 Layout::horizontal([Constraint::Length(SIDEBAR_WIDTH), Constraint::Fill(1)])
                     .areas(body);
             self.tree
-                .render(frame, sidebar, self.focus == Focus::Sidebar);
+                .render(frame, sidebar, self.focus == Focus::Sidebar, &theme);
             main
         } else {
             body
@@ -313,10 +321,11 @@ impl App {
             .areas(main);
             let div = Block::new()
                 .borders(Borders::LEFT)
-                .border_style(Style::new().fg(Color::DarkGray));
+                .border_type(theme.border_type())
+                .border_style(Style::new().fg(theme.border));
             frame.render_widget(div, divider);
             self.terminal_area
-                .render(frame, term, self.focus == Focus::Terminal);
+                .render(frame, term, self.focus == Focus::Terminal, &theme);
             editors
         } else {
             main
@@ -339,13 +348,14 @@ impl App {
             let focused = self.focus == Focus::Editor && i == self.focused;
             let buffer = &self.buffers[ed.buffer_id];
             let syntax = self.syntaxes[ed.buffer_id].as_ref();
-            ed.render(frame, region, buffer, syntax, focused);
+            ed.render(frame, region, buffer, syntax, focused, &theme);
         }
         // Thin vertical lines between panes.
         for i in 0..n.saturating_sub(1) {
             let divider = Block::new()
                 .borders(Borders::LEFT)
-                .border_style(Style::new().fg(Color::DarkGray));
+                .border_type(theme.border_type())
+                .border_style(Style::new().fg(theme.border));
             frame.render_widget(divider, regions[i * 2 + 1]);
         }
 
@@ -354,7 +364,7 @@ impl App {
             && let Some(comp) = &self.completion
             && let Some(anchor) = self.panes[self.focused].cursor_screen()
         {
-            render_completion_popup(frame, anchor, comp);
+            render_completion_popup(frame, anchor, comp, &theme);
         }
 
         // The minibuffer prompt takes over the bottom row while open, and owns
@@ -363,16 +373,16 @@ impl App {
             // The fuzzy file-finder draws its ranked results just above the
             // prompt row before the prompt itself takes the bottom line.
             if let Some(ff) = &self.file_finder {
-                render_file_finder_results(frame, footer, ff);
+                render_file_finder_results(frame, footer, ff, &theme);
             }
-            let cx = mini.render(frame, footer);
+            let cx = mini.render(frame, footer, &theme);
             frame.set_cursor_position((cx, footer.y));
         } else {
-            render_footer(frame, footer);
+            render_footer(frame, footer, &theme);
         }
 
         if self.help_visible {
-            render_help_overlay(frame);
+            render_help_overlay(frame, &theme);
         }
     }
 
@@ -998,14 +1008,14 @@ fn is_diff_toggle(key: &KeyEvent) -> bool {
 
 /// Render the bottom keybinding hint so the core chords are discoverable. Built
 /// from [`BINDINGS`] so it can never drift from the help overlay.
-fn render_footer(frame: &mut Frame, area: Rect) {
+fn render_footer(frame: &mut Frame, area: Rect, theme: &Theme) {
     let mut hint = String::new();
     for b in BINDINGS {
         if let Some(label) = b.footer {
             hint.push_str(&format!("  {} {} ", compact_keys(b.keys), label));
         }
     }
-    let style = Style::new().bg(Color::DarkGray).fg(Color::White);
+    let style = Style::new().bg(theme.inactive_bg).fg(theme.text);
     frame.render_widget(Paragraph::new(hint).style(style), area);
 }
 
@@ -1018,7 +1028,7 @@ fn compact_keys(keys: &str) -> String {
 
 /// Draw the keybinding help overlay centered over the screen. Modal: the caller
 /// has already ensured input is swallowed while it is visible.
-fn render_help_overlay(frame: &mut Frame) {
+fn render_help_overlay(frame: &mut Frame, theme: &Theme) {
     let mut lines: Vec<Line> = Vec::new();
     let mut group = "";
     for b in BINDINGS {
@@ -1026,7 +1036,7 @@ fn render_help_overlay(frame: &mut Frame) {
             if !group.is_empty() {
                 lines.push(Line::raw(""));
             }
-            lines.push(Line::styled(b.group, Style::new().fg(Color::Yellow)));
+            lines.push(Line::styled(b.group, Style::new().fg(theme.accent)));
             group = b.group;
         }
         lines.push(Line::raw(format!("  {:<22} {}", b.keys, b.action)));
@@ -1034,14 +1044,15 @@ fn render_help_overlay(frame: &mut Frame) {
     lines.push(Line::raw(""));
     lines.push(Line::styled(
         "  Esc or F1 to close",
-        Style::new().fg(Color::DarkGray),
+        Style::new().fg(theme.text_muted),
     ));
 
     let height = lines.len() as u16 + 2; // + borders
     let area = centered_rect(frame.area(), 52, height);
     let block = Block::new()
         .borders(Borders::ALL)
-        .border_style(Style::new().fg(Color::Blue))
+        .border_type(theme.border_type())
+        .border_style(Style::new().fg(theme.focus_bg))
         .title(" NyxVim — Keybindings ");
     frame.render_widget(Clear, area);
     frame.render_widget(Paragraph::new(Text::from(lines)).block(block), area);
@@ -1050,7 +1061,7 @@ fn render_help_overlay(frame: &mut Frame) {
 /// Draw the completion popup as a bordered list anchored just below the cursor
 /// (`anchor` is the cursor's screen position), flipping above when there is no
 /// room below. Rows and width are bounded; the selected entry is highlighted.
-fn render_completion_popup(frame: &mut Frame, anchor: (u16, u16), comp: &Completion) {
+fn render_completion_popup(frame: &mut Frame, anchor: (u16, u16), comp: &Completion, theme: &Theme) {
     let screen = frame.area();
     let rows = comp.candidates.len().min(MAX_CANDIDATES);
     if rows == 0 {
@@ -1088,9 +1099,9 @@ fn render_completion_popup(frame: &mut Frame, anchor: (u16, u16), comp: &Complet
         .enumerate()
         .map(|(i, cand)| {
             let style = if i == comp.selected {
-                Style::new().bg(Color::Blue).fg(Color::White)
+                Style::new().bg(theme.focus_bg).fg(theme.focus_fg)
             } else {
-                Style::new().fg(Color::Gray)
+                Style::new().fg(theme.inactive_fg)
             };
             Line::styled(cand.clone(), style)
         })
@@ -1098,7 +1109,8 @@ fn render_completion_popup(frame: &mut Frame, anchor: (u16, u16), comp: &Complet
 
     let block = Block::new()
         .borders(Borders::ALL)
-        .border_style(Style::new().fg(Color::DarkGray));
+        .border_type(theme.border_type())
+        .border_style(Style::new().fg(theme.border));
     let area = Rect::new(x, y, w, h);
     frame.render_widget(Clear, area);
     frame.render_widget(Paragraph::new(Text::from(lines)).block(block), area);
@@ -1111,7 +1123,7 @@ const MAX_FINDER_ROWS: usize = 10;
 /// above `prompt_row` (the bottom prompt line), left-aligned. A scrolling window
 /// keeps the selected row visible; the selection is highlighted. Draws nothing
 /// when there are no matches (the prompt row alone then shows the empty query).
-fn render_file_finder_results(frame: &mut Frame, prompt_row: Rect, ff: &FileFinder) {
+fn render_file_finder_results(frame: &mut Frame, prompt_row: Rect, ff: &FileFinder, theme: &Theme) {
     let screen = frame.area();
     let total = ff.matches.len();
     let rows = total.min(MAX_FINDER_ROWS);
@@ -1142,9 +1154,9 @@ fn render_file_finder_results(frame: &mut Frame, prompt_row: Rect, ff: &FileFind
         .iter()
         .map(|(idx, display)| {
             let style = if *idx == ff.selected {
-                Style::new().bg(Color::Blue).fg(Color::White)
+                Style::new().bg(theme.focus_bg).fg(theme.focus_fg)
             } else {
-                Style::new().fg(Color::Gray)
+                Style::new().fg(theme.inactive_fg)
             };
             Line::styled((*display).to_string(), style)
         })
@@ -1152,7 +1164,8 @@ fn render_file_finder_results(frame: &mut Frame, prompt_row: Rect, ff: &FileFind
 
     let block = Block::new()
         .borders(Borders::ALL)
-        .border_style(Style::new().fg(Color::DarkGray));
+        .border_type(theme.border_type())
+        .border_style(Style::new().fg(theme.border));
     let area = Rect::new(x, y, w, h);
     frame.render_widget(Clear, area);
     frame.render_widget(Paragraph::new(Text::from(lines)).block(block), area);

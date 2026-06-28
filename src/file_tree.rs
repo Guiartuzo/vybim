@@ -9,10 +9,12 @@ use std::path::{Path, PathBuf};
 
 use ratatui::Frame;
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Style};
+use ratatui::style::Style;
 use ratatui::text::{Line, Text};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use walkdir::WalkDir;
+
+use crate::theme::Theme;
 
 #[derive(Debug)]
 struct Node {
@@ -163,7 +165,7 @@ impl FileTree {
         }
     }
 
-    pub fn render(&self, frame: &mut Frame, area: Rect, focused: bool) {
+    pub fn render(&self, frame: &mut Frame, area: Rect, focused: bool, theme: &Theme) {
         let visible = self.visible();
         let mut lines: Vec<Line> = Vec::with_capacity(visible.len());
         for (i, node) in visible.iter().enumerate() {
@@ -182,9 +184,10 @@ impl FileTree {
 
             let style = if i == self.selected {
                 if focused {
-                    Style::new().bg(Color::Blue).fg(Color::White)
+                    Style::new().bg(theme.focus_bg).fg(theme.focus_fg)
                 } else {
-                    Style::new().bg(Color::DarkGray)
+                    // Unfocused selection tints only the background (no fg).
+                    Style::new().bg(theme.inactive_bg)
                 }
             } else {
                 Style::new()

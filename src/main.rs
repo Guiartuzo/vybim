@@ -11,6 +11,7 @@ mod syntax;
 mod terminal;
 mod terminal_area;
 mod terminal_pane;
+mod theme;
 
 use app::App;
 use buffer::Buffer;

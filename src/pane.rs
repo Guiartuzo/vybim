@@ -8,20 +8,13 @@
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::Paragraph;
 
 use crate::buffer::Buffer;
 use crate::syntax::Syntax;
-
-/// Background of the line the cursor is on (a subtle dark gray from the 256
-/// palette, so it reads on most terminals without truecolor).
-const CURRENT_LINE_BG: Color = Color::Indexed(236);
-
-/// Background of selected text — a blue from the 256 palette, distinct from the
-/// current-line tint so a selection clearly stands out.
-const SELECTION_BG: Color = Color::Indexed(24);
+use crate::theme::Theme;
 
 /// Cursor position within the buffer. `target_col` remembers the column the
 /// user "wants" so vertical movement across short lines doesn't lose it.
@@ -670,12 +663,13 @@ impl EditorPane {
         buffer: &Buffer,
         syntax: Option<&Syntax>,
         focused: bool,
+        theme: &Theme,
     ) {
         let [content, status] =
             Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(area);
 
-        self.render_content(frame, content, buffer, syntax, focused);
-        self.render_status(frame, status, buffer, focused);
+        self.render_content(frame, content, buffer, syntax, focused, theme);
+        self.render_status(frame, status, buffer, focused, theme);
     }
 
     fn render_content(
@@ -685,6 +679,7 @@ impl EditorPane {
         buffer: &Buffer,
         syntax: Option<&Syntax>,
         focused: bool,
+        theme: &Theme,
     ) {
         // Reserve a left gutter for line numbers; text fills the rest.
         let num_w = gutter_num_width(buffer.line_count());
@@ -708,9 +703,9 @@ impl EditorPane {
             }
             let is_current = line_idx == self.cursor.line;
             let num_style = if is_current && focused {
-                Style::new().fg(Color::White)
+                Style::new().fg(theme.text)
             } else {
-                Style::new().fg(Color::DarkGray)
+                Style::new().fg(theme.text_muted)
             };
             numbers.push(Line::styled(
                 format!("{:>width$} ", line_idx + 1, width = num_w),
@@ -732,7 +727,7 @@ impl EditorPane {
                 let row_rect = Rect::new(area.x, content.y + row, area.width, 1);
                 frame
                     .buffer_mut()
-                    .set_style(row_rect, Style::new().bg(CURRENT_LINE_BG));
+                    .set_style(row_rect, Style::new().bg(theme.cursor_line));
             }
         }
 
@@ -741,6 +736,7 @@ impl EditorPane {
         // secondary — contributes its own selection.
         let scroll_row = self.scroll_row;
         let scroll_col = self.scroll_col;
+        let selection_bg = theme.selection;
         let paint_selection = |frame: &mut Frame, sel_start: (usize, usize), sel_end: (usize, usize)| {
             for row in 0..height {
                 let line_idx = scroll_row + row;
@@ -768,7 +764,7 @@ impl EditorPane {
                 let rect = Rect::new(sx, content.y + row as u16, w, 1);
                 frame
                     .buffer_mut()
-                    .set_style(rect, Style::new().bg(SELECTION_BG));
+                    .set_style(rect, Style::new().bg(selection_bg));
             }
         };
         if let Some((s, e)) = self.ordered_selection() {
@@ -808,7 +804,7 @@ impl EditorPane {
         }
     }
 
-    fn render_status(&self, frame: &mut Frame, area: Rect, buffer: &Buffer, focused: bool) {
+    fn render_status(&self, frame: &mut Frame, area: Rect, buffer: &Buffer, focused: bool, theme: &Theme) {
         let name = buffer
             .path()
             .map(|p| p.display().to_string())
@@ -821,11 +817,7 @@ impl EditorPane {
             self.cursor.col + 1
         );
         // The focused pane's status bar stands out so it's clear where input goes.
-        let style = if focused {
-            Style::new().bg(Color::Blue).fg(Color::White)
-        } else {
-            Style::new().bg(Color::DarkGray).fg(Color::Gray)
-        };
+        let style = theme.list_row(focused);
         frame.render_widget(Paragraph::new(text).style(style), area);
     }
 }

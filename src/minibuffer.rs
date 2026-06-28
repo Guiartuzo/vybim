@@ -6,8 +6,10 @@
 
 use ratatui::Frame;
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Style};
+use ratatui::style::Style;
 use ratatui::widgets::Paragraph;
+
+use crate::theme::Theme;
 
 /// Which feature the minibuffer is currently driving.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -61,9 +63,9 @@ impl Minibuffer {
 
     /// Draw `<prompt><input>` across `area` and return the screen column where
     /// the text cursor belongs (just past the input, clamped into the row).
-    pub fn render(&self, frame: &mut Frame, area: Rect) -> u16 {
+    pub fn render(&self, frame: &mut Frame, area: Rect, theme: &Theme) -> u16 {
         let text = format!("{}{}", self.prompt, self.input);
-        let style = Style::new().bg(Color::Black).fg(Color::White);
+        let style = Style::new().bg(theme.prompt_bg).fg(theme.text);
         frame.render_widget(Paragraph::new(text).style(style), area);
         let col = (self.prompt.chars().count() + self.input.chars().count()) as u16;
         area.x + col.min(area.width.saturating_sub(1))

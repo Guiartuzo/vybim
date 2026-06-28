@@ -10,11 +10,12 @@
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::{Color, Style};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
 use crate::terminal_pane::TerminalPane;
+use crate::theme::Theme;
 
 #[derive(Debug, Default)]
 pub struct TerminalArea {
@@ -119,26 +120,27 @@ impl TerminalArea {
 
     /// Render the tab strip and the active terminal into `area`. The caller
     /// only invokes this when the area is visible; an empty area draws nothing.
-    pub fn render(&mut self, frame: &mut Frame, area: Rect, focused: bool) {
+    pub fn render(&mut self, frame: &mut Frame, area: Rect, focused: bool, theme: &Theme) {
         if self.terminals.is_empty() {
             return;
         }
         let [tabs, content] =
             Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).areas(area);
-        self.render_tabs(frame, tabs, focused);
+        self.render_tabs(frame, tabs, focused, theme);
         self.terminals[self.active].render(frame, content, focused);
     }
 
     /// A thin tab strip numbering the terminals, with the active one marked.
-    fn render_tabs(&self, frame: &mut Frame, area: Rect, focused: bool) {
+    fn render_tabs(&self, frame: &mut Frame, area: Rect, focused: bool, theme: &Theme) {
         let mut spans: Vec<Span> = Vec::with_capacity(self.terminals.len());
         for i in 0..self.terminals.len() {
             let label = format!(" {} ", i + 1);
             let style = if i == self.active {
-                let bg = if focused { Color::Blue } else { Color::DarkGray };
-                Style::new().bg(bg).fg(Color::White)
+                // Active tab: background tracks focus, foreground stays focus-fg.
+                let bg = if focused { theme.focus_bg } else { theme.inactive_bg };
+                Style::new().bg(bg).fg(theme.focus_fg)
             } else {
-                Style::new().fg(Color::Gray)
+                Style::new().fg(theme.inactive_fg)
             };
             spans.push(Span::styled(label, style));
         }

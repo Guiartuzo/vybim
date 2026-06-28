@@ -11,21 +11,16 @@ use std::path::PathBuf;
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use similar::{ChangeTag, TextDiff};
 
 use crate::git::{self, ChangeKind, ChangedFile, FileContents};
+use crate::theme::Theme;
 
 /// Width of the changed-files list column, in columns.
 const LIST_WIDTH: u16 = 30;
-
-const ADD_FG: Color = Color::Green;
-const DEL_FG: Color = Color::Red;
-const ADD_BG: Color = Color::Indexed(22); // dark green
-const DEL_BG: Color = Color::Indexed(52); // dark red
-const GAP_BG: Color = Color::Indexed(235); // the empty opposite side of a change
 
 /// One aligned row of a side-by-side diff. `Equal` lines sit across from each
 /// other; `Delete` is left-only (removed), `Insert` is right-only (added).
@@ -230,7 +225,7 @@ impl DiffView {
 
     /// Draw the view over `area`, claiming the whole body. Modal: the caller has
     /// ensured input is routed here while it is open.
-    pub fn render(&mut self, frame: &mut Frame, area: Rect) {
+    pub fn render(&mut self, frame: &mut Frame, area: Rect, theme: &Theme) {
         frame.render_widget(Clear, area);
         let [list_area, divider, diff_area] = Layout::horizontal([
             Constraint::Length(LIST_WIDTH),
@@ -239,15 +234,16 @@ impl DiffView {
         ])
         .areas(area);
 
-        self.render_list(frame, list_area);
+        self.render_list(frame, list_area, theme);
         let div = Block::new()
             .borders(Borders::LEFT)
-            .border_style(Style::new().fg(Color::DarkGray));
+            .border_type(theme.border_type())
+            .border_style(Style::new().fg(theme.border));
         frame.render_widget(div, divider);
-        self.render_diff(frame, diff_area);
+        self.render_diff(frame, diff_area, theme);
     }
 
-    fn render_list(&self, frame: &mut Frame, area: Rect) {
+    fn render_list(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
         let title = if self.root.is_none() {
             " no git repository "
         } else if self.files.is_empty() {
@@ -257,7 +253,7 @@ impl DiffView {
         };
         let block = Block::new()
             .borders(Borders::NONE)
-            .title(Span::styled(title, Style::new().fg(Color::Yellow)));
+            .title(Span::styled(title, Style::new().fg(theme.accent)));
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
@@ -265,14 +261,17 @@ impl DiffView {
         let mut lines: Vec<Line> = Vec::with_capacity(self.files.len());
         for (i, f) in self.files.iter().enumerate() {
             let kind_style = match f.kind {
-                ChangeKind::Modified => Style::new().fg(Color::Yellow),
-                ChangeKind::Added => Style::new().fg(ADD_FG),
-                ChangeKind::Deleted => Style::new().fg(DEL_FG),
+                ChangeKind::Modified => Style::new().fg(theme.accent),
+                ChangeKind::Added => Style::new().fg(theme.diff_add_fg),
+                ChangeKind::Deleted => Style::new().fg(theme.diff_del_fg),
             };
             let selected = i == self.selected;
             let row_style = if selected {
-                let bg = if list_focused { Color::Blue } else { Color::DarkGray };
-                Style::new().bg(bg).fg(Color::White)
+                // Selected row keeps a focus-colored foreground in both states;
+                // only the background tracks focus, so this builds from tokens
+                // rather than `list_row` (whose unfocused fg differs).
+                let bg = if list_focused { theme.focus_bg } else { theme.inactive_bg };
+                Style::new().bg(bg).fg(theme.focus_fg)
             } else {
                 Style::new()
             };
@@ -284,10 +283,10 @@ impl DiffView {
         frame.render_widget(Paragraph::new(lines), inner);
     }
 
-    fn render_diff(&self, frame: &mut Frame, area: Rect) {
+    fn render_diff(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
         // Empty / placeholder states.
         if let Some(msg) = self.placeholder() {
-            let p = Paragraph::new(msg).style(Style::new().fg(Color::DarkGray));
+            let p = Paragraph::new(msg).style(Style::new().fg(theme.text_muted));
             frame.render_widget(p, area);
             return;
         }
@@ -297,9 +296,9 @@ impl DiffView {
             Layout::vertical([Constraint::Length(1), Constraint::Fill(1)]).areas(area);
         let diff_focused = self.focus == DiffFocus::Diff;
         let header_style = if diff_focused {
-            Style::new().fg(Color::White).add_modifier(Modifier::BOLD)
+            Style::new().fg(theme.text).add_modifier(Modifier::BOLD)
         } else {
-            Style::new().fg(Color::Gray)
+            Style::new().fg(theme.inactive_fg)
         };
         frame.render_widget(Paragraph::new(Span::styled(path, header_style)), header);
 
@@ -315,14 +314,15 @@ impl DiffView {
         let mut left_lines: Vec<Line> = Vec::with_capacity(height);
         let mut right_lines: Vec<Line> = Vec::with_capacity(height);
         for row in self.file.rows.iter().skip(self.file.scroll).take(height) {
-            let (l, r) = render_row(row);
+            let (l, r) = render_row(row, theme);
             left_lines.push(l);
             right_lines.push(r);
         }
         frame.render_widget(Paragraph::new(left_lines), left);
         let div = Block::new()
             .borders(Borders::LEFT)
-            .border_style(Style::new().fg(Color::DarkGray));
+            .border_type(theme.border_type())
+            .border_style(Style::new().fg(theme.border));
         frame.render_widget(div, mid);
         frame.render_widget(Paragraph::new(right_lines), right);
     }
@@ -345,16 +345,16 @@ impl DiffView {
 
 /// Render one diff row into its (left, right) styled lines, gap-filling the
 /// opposite side of an insert/delete.
-fn render_row(row: &DiffRow) -> (Line<'static>, Line<'static>) {
+fn render_row(row: &DiffRow, theme: &Theme) -> (Line<'static>, Line<'static>) {
     match row {
         DiffRow::Equal(t) => (Line::raw(t.clone()), Line::raw(t.clone())),
         DiffRow::Delete(t) => (
-            Line::styled(t.clone(), Style::new().fg(DEL_FG).bg(DEL_BG)),
-            Line::styled("", Style::new().bg(GAP_BG)),
+            Line::styled(t.clone(), Style::new().fg(theme.diff_del_fg).bg(theme.diff_del_bg)),
+            Line::styled("", Style::new().bg(theme.diff_gap_bg)),
         ),
         DiffRow::Insert(t) => (
-            Line::styled("", Style::new().bg(GAP_BG)),
-            Line::styled(t.clone(), Style::new().fg(ADD_FG).bg(ADD_BG)),
+            Line::styled("", Style::new().bg(theme.diff_gap_bg)),
+            Line::styled(t.clone(), Style::new().fg(theme.diff_add_fg).bg(theme.diff_add_bg)),
         ),
     }
 }
