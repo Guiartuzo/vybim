@@ -1341,6 +1341,8 @@ fn dispatch_editor(ed: &mut EditorPane, buffer: &mut Buffer, key: KeyEvent) {
         }
         KeyCode::Char('z') if ctrl => ed.undo(buffer),
         KeyCode::Char('y') if ctrl => ed.redo(buffer),
+        KeyCode::Left if ctrl => ed.move_word_left(buffer, extend),
+        KeyCode::Right if ctrl => ed.move_word_right(buffer, extend),
         KeyCode::Left => ed.move_left(buffer, extend),
         KeyCode::Right => ed.move_right(buffer, extend),
         KeyCode::Up => ed.move_up(buffer, extend),

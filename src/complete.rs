@@ -94,8 +94,9 @@ impl Completion {
     }
 }
 
-/// Is `ch` part of an identifier token (`[A-Za-z0-9_]`)?
-fn is_word_char(ch: char) -> bool {
+/// Is `ch` part of an identifier token (`[A-Za-z0-9_]`)? Shared with cursor
+/// word-movement so "what counts as a word" stays consistent.
+pub(crate) fn is_word_char(ch: char) -> bool {
     ch == '_' || ch.is_ascii_alphanumeric()
 }
 

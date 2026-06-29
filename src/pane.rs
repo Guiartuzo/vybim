@@ -13,6 +13,7 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::Paragraph;
 
 use crate::buffer::Buffer;
+use crate::complete::is_word_char;
 use crate::syntax::Syntax;
 use crate::theme::Theme;
 
@@ -267,6 +268,32 @@ impl EditorPane {
                 c.cursor.col = 0;
             }
             c.cursor.target_col = c.cursor.col;
+        });
+    }
+
+    /// Move each caret forward to the next word boundary: skip any separators
+    /// (crossing line ends), then advance over word chars, landing just past the
+    /// word. `extend` grows the selection instead of collapsing it.
+    pub fn move_word_right(&mut self, buffer: &Buffer, extend: bool) {
+        self.apply_to_carets(|c| {
+            pre_move(c, extend);
+            let (line, col) = scan_word_right(buffer, c.cursor.line, c.cursor.col);
+            c.cursor.line = line;
+            c.cursor.col = col;
+            c.cursor.target_col = col;
+        });
+    }
+
+    /// Move each caret backward to the previous word boundary: step back over
+    /// separators (crossing line starts), then over word chars, landing at the
+    /// start of the word. `extend` grows the selection instead of collapsing it.
+    pub fn move_word_left(&mut self, buffer: &Buffer, extend: bool) {
+        self.apply_to_carets(|c| {
+            pre_move(c, extend);
+            let (line, col) = scan_word_left(buffer, c.cursor.line, c.cursor.col);
+            c.cursor.line = line;
+            c.cursor.col = col;
+            c.cursor.target_col = col;
         });
     }
 
@@ -885,6 +912,63 @@ fn highlight_line(text: &str, syntax: Option<&Syntax>) -> Line<'static> {
     Line::from(out)
 }
 
+/// Forward word-boundary scan from `(line, col)`: skip separators (crossing line
+/// ends), then advance over word chars, returning the position just past the
+/// word (or the buffer end). Re-collects a line's chars only when crossing a
+/// line boundary.
+fn scan_word_right(buffer: &Buffer, mut line: usize, mut col: usize) -> (usize, usize) {
+    let last = buffer.line_count() - 1;
+    let mut chars: Vec<char> = buffer.line_text(line).chars().collect();
+    // Skip separators, crossing line ends, until a word char or the buffer end.
+    loop {
+        if col < chars.len() {
+            if is_word_char(chars[col]) {
+                break;
+            }
+            col += 1;
+        } else if line < last {
+            line += 1;
+            col = 0;
+            chars = buffer.line_text(line).chars().collect();
+        } else {
+            return (line, col); // end of buffer
+        }
+    }
+    // Advance over the word to the following separator / line end.
+    while col < chars.len() && is_word_char(chars[col]) {
+        col += 1;
+    }
+    (line, col)
+}
+
+/// Backward word-boundary scan from `(line, col)`: step back over separators
+/// (crossing line starts), then over word chars, returning the start of the word
+/// (or the buffer start). Re-collects a line's chars only when crossing a line
+/// boundary.
+fn scan_word_left(buffer: &Buffer, mut line: usize, mut col: usize) -> (usize, usize) {
+    let mut chars: Vec<char> = buffer.line_text(line).chars().collect();
+    // Step back over separators (looking at the char before the position).
+    loop {
+        if col > 0 {
+            if is_word_char(chars[col - 1]) {
+                break;
+            }
+            col -= 1;
+        } else if line > 0 {
+            line -= 1;
+            chars = buffer.line_text(line).chars().collect();
+            col = chars.len();
+        } else {
+            return (line, col); // start of buffer
+        }
+    }
+    // Step back over the word to its first char.
+    while col > 0 && is_word_char(chars[col - 1]) {
+        col -= 1;
+    }
+    (line, col)
+}
+
 /// Manage a caret's selection anchor for a movement: extend keeps/sets the
 /// anchor, a plain move collapses any selection.
 fn pre_move(caret: &mut Caret, extend: bool) {
@@ -1019,6 +1103,68 @@ mod tests {
         assert_eq!((p.cursor.line, p.cursor.col), (1, 0));
         p.move_left(&b, false);
         assert_eq!((p.cursor.line, p.cursor.col), (0, 2));
+    }
+
+    #[test]
+    fn word_right_stops_at_end_of_next_word() {
+        let (mut p, b) = setup("foo bar baz");
+        p.move_word_right(&b, false); // end of "foo"
+        assert_eq!((p.cursor.line, p.cursor.col), (0, 3));
+        p.move_word_right(&b, false); // skip space, end of "bar"
+        assert_eq!((p.cursor.line, p.cursor.col), (0, 7));
+    }
+
+    #[test]
+    fn word_left_stops_at_start_of_previous_word() {
+        let (mut p, b) = setup("foo bar baz");
+        p.cursor.col = 11; // end of line
+        p.move_word_left(&b, false); // start of "baz"
+        assert_eq!((p.cursor.line, p.cursor.col), (0, 8));
+        p.move_word_left(&b, false); // start of "bar"
+        assert_eq!((p.cursor.line, p.cursor.col), (0, 4));
+    }
+
+    #[test]
+    fn word_movement_wraps_across_line_boundaries() {
+        let (mut p, b) = setup("foo\nbar");
+        p.cursor.col = 3; // end of "foo"
+        p.move_word_right(&b, false); // cross newline, end of "bar"
+        assert_eq!((p.cursor.line, p.cursor.col), (1, 3));
+        p.move_word_left(&b, false); // start of "bar"
+        assert_eq!((p.cursor.line, p.cursor.col), (1, 0));
+        p.move_word_left(&b, false); // cross newline back, start of "foo"
+        assert_eq!((p.cursor.line, p.cursor.col), (0, 0));
+    }
+
+    #[test]
+    fn word_movement_clamps_at_buffer_ends() {
+        let (mut p, b) = setup("foo bar");
+        p.move_word_left(&b, false); // already at start
+        assert_eq!((p.cursor.line, p.cursor.col), (0, 0));
+        p.cursor.col = 7; // end of buffer
+        p.move_word_right(&b, false); // nowhere to go
+        assert_eq!((p.cursor.line, p.cursor.col), (0, 7));
+    }
+
+    #[test]
+    fn shift_word_move_extends_selection_plain_collapses() {
+        let (mut p, b) = setup("foo bar");
+        p.move_word_right(&b, true); // select "foo"
+        assert_eq!(p.ordered_selection(), Some(((0, 0), (0, 3))));
+        p.move_word_left(&b, false); // plain move collapses
+        assert_eq!(p.ordered_selection(), None);
+    }
+
+    #[test]
+    fn word_movement_applies_at_every_caret() {
+        let (mut p, b) = setup("foo bar\nfoo bar");
+        p.add_caret_below(&b);
+        p.move_word_right(&b, false); // both carets to end of "foo"
+        assert_eq!((p.cursor.line, p.cursor.col), (0, 3));
+        assert_eq!(
+            (p.secondary[0].cursor.line, p.secondary[0].cursor.col),
+            (1, 3)
+        );
     }
 
     #[test]
