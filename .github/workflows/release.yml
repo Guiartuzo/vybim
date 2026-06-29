@@ -1,0 +1,69 @@
+# .github/workflows/release.yml
+# Build per-OS binaries and publish them as assets on a GitHub Release, so
+# users can download a binary instead of building from source.
+#
+# Cut a release by pushing a version tag:
+#   git tag v0.1.0 && git push origin v0.1.0
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+# Needed to create the release and upload assets.
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release:
+    name: Release (${{ matrix.target_label }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target_label: linux-x86_64
+            bin: nyxvim
+          - os: macos-latest
+            target_label: macos-arm64
+            bin: nyxvim
+          - os: windows-latest
+            target_label: windows-x86_64
+            bin: nyxvim.exe
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      # tree-sitter-rust builds a C grammar — Linux needs gcc; Windows (MSVC)
+      # and macOS (clang) runners already ship a C toolchain.
+      - name: Install C toolchain (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y gcc
+
+      - name: Build release binary
+        run: cargo build --release --verbose
+
+      - name: Package (tar.gz)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          name="nyxvim-${GITHUB_REF_NAME}-${{ matrix.target_label }}"
+          tar -czf "${name}.tar.gz" -C target/release "${{ matrix.bin }}"
+          echo "ASSET=${name}.tar.gz" >> "$GITHUB_ENV"
+
+      - name: Package (zip)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          name="nyxvim-${GITHUB_REF_NAME}-${{ matrix.target_label }}"
+          7z a "${name}.zip" "./target/release/${{ matrix.bin }}"
+          echo "ASSET=${name}.zip" >> "$GITHUB_ENV"
+
+      - name: Upload to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ env.ASSET }}
+          generate_release_notes: true
