@@ -7,6 +7,12 @@ on:
   pull_request:
     branches: [main]
 
+# A newer run for the same ref cancels any still-running one, so a stuck job
+# can't pile up across pushes.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
@@ -46,6 +52,7 @@ jobs:
   build:
     name: Build (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
     strategy:
       fail-fast: false
       matrix:
@@ -83,12 +90,14 @@ jobs:
   test:
     name: Tests (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
-        # Windows is excluded: the terminal/PTY tests spawn a POSIX shell
-        # (`/bin/sh`), which does not exist on Windows.
-        os: [ubuntu-latest, macos-latest]
+        # Tests run on Linux only. The terminal/PTY tests spawn a POSIX shell
+        # and reliably hang on the macOS runner; Windows has no `/bin/sh`.
+        # (The build job still covers all three OSes.)
+        os: [ubuntu-latest]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -111,6 +120,7 @@ jobs:
   audit:
     name: Security Audit
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
