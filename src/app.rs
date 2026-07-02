@@ -467,6 +467,17 @@ impl App {
             }
         });
 
+        // The initial buffer (a file given on the command line) is loaded
+        // before the loop starts, so it never went through `open_in_focused_pane`
+        // — announce it to the language server now that the loop (and `event_tx`)
+        // is live, so features like go-to-definition work on it.
+        if let Some(path) = self.buffers[self.panes[self.focused].buffer_id]
+            .path()
+            .map(Path::to_path_buf)
+        {
+            self.lsp_did_open(&path);
+        }
+
         while !self.should_quit {
             terminal.draw(|frame| self.render(frame))?;
 
