@@ -8,7 +8,6 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use lsp_types::ServerCapabilities;
 use serde_json::{Value, json};
 
 use crate::lsp::protocol::{IdSource, RequestId, notification_body, request_body};
@@ -26,7 +25,11 @@ pub enum PendingKind {
 #[derive(Debug)]
 pub struct Server {
     pub id: usize,
-    pub capabilities: Option<ServerCapabilities>,
+    /// The server's advertised capabilities as raw JSON. Kept as a `Value`
+    /// rather than a typed `ServerCapabilities` so a schema drift between a
+    /// server and our `lsp-types` version can't fail the whole parse and
+    /// silently disable features.
+    pub capabilities: Option<Value>,
     ids: IdSource,
     pending: HashMap<RequestId, PendingKind>,
     /// Open documents by URI → last synced version.
@@ -65,16 +68,19 @@ impl Server {
     /// `initialized` notification body to send next.
     pub fn on_initialize_response(&mut self, result: Option<&Value>) -> Value {
         if let Some(caps) = result.and_then(|r| r.get("capabilities")) {
-            self.capabilities = serde_json::from_value(caps.clone()).ok();
+            self.capabilities = Some(caps.clone());
         }
         notification_body("initialized", json!({}))
     }
 
     /// Whether the server advertised `textDocument/definition` support.
+    /// `definitionProvider` may be `true` or an options object; anything other
+    /// than absent/`null`/`false` counts as supported.
     pub fn supports_definition(&self) -> bool {
         self.capabilities
             .as_ref()
-            .map(|c| c.definition_provider.is_some())
+            .and_then(|c| c.get("definitionProvider"))
+            .map(|v| !matches!(v, Value::Null | Value::Bool(false)))
             .unwrap_or(false)
     }
 

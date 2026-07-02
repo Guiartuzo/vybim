@@ -178,7 +178,7 @@ impl Lsp {
         self.next_id += 1;
         let sink = transport::TestSink::default();
         let mut server = Server::new(id);
-        server.capabilities = serde_json::from_value(capabilities).ok();
+        server.capabilities = Some(capabilities);
         self.servers.insert(
             language.to_string(),
             Running {
