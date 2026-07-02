@@ -12,6 +12,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Sender};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use ratatui::Frame;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -26,6 +27,7 @@ use crate::diff_view::DiffView;
 use crate::file_find::{self, FileItem};
 use crate::file_tree::FileTree;
 use crate::jump::{JumpList, JumpPoint};
+use crate::lsp::Lsp;
 use crate::minibuffer::{MiniMode, Minibuffer};
 use crate::pane::EditorPane;
 use crate::syntax::Syntax;
@@ -40,6 +42,11 @@ const SIDEBAR_WIDTH: u16 = 28;
 /// Width of the docked terminal area, in columns. Fixed in v1 (resize is a
 /// deliberate non-goal); the PTY resizes to whatever width it is given.
 const TERMINAL_AREA_WIDTH: u16 = 60;
+
+/// Minimum spacing between `textDocument/didChange` syncs while editing, so
+/// typing coalesces into at most one full-document send per interval rather
+/// than one per keystroke (never on a path that can block the edit).
+const LSP_SYNC_INTERVAL: Duration = Duration::from_millis(250);
 
 /// One keybinding, the single source of truth for the help overlay.
 struct KeyBinding {
@@ -293,6 +300,10 @@ pub enum AppEvent {
     Input(Event),
     PtyOutput(usize, Vec<u8>),
     PtyExit(usize),
+    /// A framed JSON-RPC message from language server `id`.
+    Lsp(usize, crate::lsp::Message),
+    /// Language server `id`'s subprocess exited (crash or EOF).
+    LspExit(usize),
 }
 
 /// Which region currently receives keyboard input.
@@ -396,6 +407,10 @@ pub struct App {
     theme: Theme,
     /// Browser-style back/forward history of `(path, line, col)` locations.
     jumps: JumpList,
+    /// The language-server client (lazily starts servers per language).
+    lsp: Lsp,
+    /// Last time a `didChange` was sent, for throttling document sync.
+    last_lsp_sync: Option<Instant>,
 }
 
 impl App {
@@ -423,6 +438,8 @@ impl App {
             sidebar_visible: true,
             theme: Theme::default(),
             jumps: JumpList::new(),
+            lsp: Lsp::new(),
+            last_lsp_sync: None,
         }
     }
 
@@ -457,6 +474,8 @@ impl App {
                 self.handle_app_event(ev);
             }
         }
+        // Cleanly stop every language server before leaving.
+        self.lsp.shutdown_all();
         Ok(())
     }
 
@@ -466,6 +485,13 @@ impl App {
             AppEvent::Input(_) => {}
             AppEvent::PtyOutput(id, bytes) => self.feed_terminal(id, &bytes),
             AppEvent::PtyExit(id) => self.on_terminal_exit(id),
+            AppEvent::Lsp(id, msg) => {
+                // v1 consumes only the `initialize` handshake internally; other
+                // responses route back via the return value (no consumer until
+                // go-to-definition), and notifications are stored/ignored.
+                let _ = self.lsp.handle_message(id, msg);
+            }
+            AppEvent::LspExit(id) => self.lsp.mark_exited(id),
         }
     }
 
@@ -723,7 +749,12 @@ impl App {
 
         let ed = &mut self.panes[self.focused];
         let buffer = &mut self.buffers[ed.buffer_id];
+        let before_len = buffer.len_chars();
         dispatch_editor(ed, buffer, key);
+        // If the edit changed the document, sync it to the language server.
+        if buffer.len_chars() != before_len {
+            self.lsp_did_change();
+        }
 
         // After a pass-through editing key, re-query the popup so the list tracks
         // the buffer; it closes itself when the prefix no longer matches.
@@ -815,7 +846,43 @@ impl App {
             self.syntaxes.push(syntax);
             self.panes[self.focused].set_buffer(id);
             self.focus = Focus::Editor;
+            self.lsp_did_open(&path);
         }
+    }
+
+    // --- language server hooks ---------------------------------------------
+
+    /// Notify the LSP client that `path` was opened (starts its server if one is
+    /// registered/installed). Inert unless the event loop is running.
+    fn lsp_did_open(&mut self, path: &Path) {
+        let Some(tx) = self.event_tx.clone() else {
+            return;
+        };
+        let ed = &self.panes[self.focused];
+        let text = self.buffers[ed.buffer_id].text();
+        let root = self.root.clone();
+        self.lsp.notify_opened(path, &text, &root, &tx);
+    }
+
+    /// Notify the LSP client of an edit, throttled to at most one full-document
+    /// sync per [`LSP_SYNC_INTERVAL`]. Inert unless the event loop is running.
+    fn lsp_did_change(&mut self) {
+        if self.event_tx.is_none() {
+            return;
+        }
+        let now = Instant::now();
+        if let Some(last) = self.last_lsp_sync
+            && now.duration_since(last) < LSP_SYNC_INTERVAL
+        {
+            return;
+        }
+        let ed = &self.panes[self.focused];
+        let Some(path) = self.buffers[ed.buffer_id].path().map(Path::to_path_buf) else {
+            return;
+        };
+        self.last_lsp_sync = Some(now);
+        let text = self.buffers[ed.buffer_id].text();
+        self.lsp.notify_changed(&path, &text);
     }
 
     // --- jump navigation ---------------------------------------------------
@@ -904,8 +971,15 @@ impl App {
             return;
         }
         self.completion = None;
+        let closed_buffer = self.panes[self.focused].buffer_id;
         self.panes.remove(self.focused);
         self.clamp_focus();
+        // If no remaining pane views that buffer, tell the server it closed.
+        if !self.panes.iter().any(|p| p.buffer_id == closed_buffer)
+            && let Some(path) = self.buffers[closed_buffer].path().map(Path::to_path_buf)
+        {
+            self.lsp.notify_closed(&path);
+        }
     }
 
     // --- terminal area -----------------------------------------------------
@@ -2056,6 +2130,18 @@ mod tests {
         app.on_key(press(KeyCode::F(11), KeyModifiers::SHIFT));
         assert_eq!(focused_path(&app), bravo);
 
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn opening_a_served_file_starts_no_server_without_the_event_loop() {
+        // Inertness: with no running event loop (event_tx unset, as in every
+        // unit test) opening a .rs file must not spawn a language server.
+        let (mut app, dir, alpha, bravo) = jump_fixture("inert");
+        assert!(app.event_tx.is_none());
+        app.jump_to(&bravo, 0, 0);
+        app.jump_to(&alpha, 0, 0);
+        assert_eq!(app.lsp.running_count(), 0);
         std::fs::remove_dir_all(&dir).ok();
     }
 

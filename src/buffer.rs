@@ -274,6 +274,36 @@ impl Buffer {
     pub fn is_dirty(&self) -> bool {
         self.dirty
     }
+
+    /// The full document text, for LSP document synchronization.
+    pub fn text(&self) -> String {
+        self.rope.to_string()
+    }
+
+    /// The number of UTF-16 code units from the start of `line` to `char_col`
+    /// characters in. LSP columns are UTF-16 code units, not chars/bytes; this
+    /// is the conversion at the protocol boundary. Out-of-range inputs clamp.
+    pub fn utf16_col(&self, line: usize, char_col: usize) -> usize {
+        let last = self.rope.len_lines().saturating_sub(1);
+        let line = line.min(last);
+        let slice = self.rope.line(line);
+        // Clamp to the line's *content* length, excluding the trailing newline.
+        let cc = char_col.min(self.line_len_chars(line));
+        slice.char_to_utf16_cu(cc)
+    }
+
+    /// The character column corresponding to `utf16_col` UTF-16 code units into
+    /// `line` — the inverse of [`utf16_col`](Self::utf16_col). Out-of-range
+    /// inputs clamp.
+    pub fn char_col_from_utf16(&self, line: usize, utf16_col: usize) -> usize {
+        let last = self.rope.len_lines().saturating_sub(1);
+        let line = line.min(last);
+        let slice = self.rope.line(line);
+        // Clamp to the line's content length in UTF-16 units (newline excluded).
+        let max_u16 = slice.char_to_utf16_cu(self.line_len_chars(line));
+        let u = utf16_col.min(max_u16);
+        slice.utf16_cu_to_char(u)
+    }
 }
 
 #[cfg(test)]

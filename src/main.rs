@@ -6,6 +6,7 @@ mod file_find;
 mod file_tree;
 mod git;
 mod jump;
+mod lsp;
 mod minibuffer;
 mod pane;
 mod syntax;
