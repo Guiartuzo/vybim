@@ -312,8 +312,7 @@ mod tests {
     #[test]
     fn save_writes_file_and_clears_dirty() {
         use std::io::Read;
-        let path =
-            std::env::temp_dir().join(format!("vybim_save_test_{}.txt", std::process::id()));
+        let path = std::env::temp_dir().join(format!("vybim_save_test_{}.txt", std::process::id()));
         std::fs::write(&path, "old").unwrap();
 
         let mut b = Buffer::from_path(&path).unwrap();
