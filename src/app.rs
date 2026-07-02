@@ -25,6 +25,7 @@ use crate::complete::{Completion, MAX_CANDIDATES};
 use crate::diff_view::DiffView;
 use crate::file_find::{self, FileItem};
 use crate::file_tree::FileTree;
+use crate::jump::{JumpList, JumpPoint};
 use crate::minibuffer::{MiniMode, Minibuffer};
 use crate::pane::EditorPane;
 use crate::syntax::Syntax;
@@ -143,6 +144,16 @@ const BINDINGS: &[KeyBinding] = &[
         group: "Editor",
         keys: "Ctrl+P",
         action: "Fuzzy file finder",
+    },
+    KeyBinding {
+        group: "Editor",
+        keys: "F11",
+        action: "Jump back",
+    },
+    KeyBinding {
+        group: "Editor",
+        keys: "Shift+F11",
+        action: "Jump forward",
     },
     KeyBinding {
         group: "Editor",
@@ -383,6 +394,8 @@ pub struct App {
     sidebar_visible: bool,
     /// The UI color theme; the single source of truth for chrome colors.
     theme: Theme,
+    /// Browser-style back/forward history of `(path, line, col)` locations.
+    jumps: JumpList,
 }
 
 impl App {
@@ -409,6 +422,7 @@ impl App {
             help_visible: false,
             sidebar_visible: true,
             theme: Theme::default(),
+            jumps: JumpList::new(),
         }
     }
 
@@ -695,6 +709,10 @@ impl App {
             KeyCode::Char('p') if ctrl => return self.open_file_finder(),
             KeyCode::Left if alt => return self.focus_prev(),
             KeyCode::Right if alt => return self.focus_next(),
+            // Jump history: F11 back, Shift+F11 forward (pairs with F12
+            // go-to-definition). Shift variant matched first.
+            KeyCode::F(11) if shift => return self.jump_forward(),
+            KeyCode::F(11) => return self.jump_back(),
             // Autocomplete trigger: `Ctrl+N` (reliable) plus a best-effort
             // `Ctrl+Space` alias (reported as `Char(' ')`+Ctrl or `Null`).
             KeyCode::Char('n') if ctrl => return self.open_completion(),
@@ -797,6 +815,56 @@ impl App {
             self.syntaxes.push(syntax);
             self.panes[self.focused].set_buffer(id);
             self.focus = Focus::Editor;
+        }
+    }
+
+    // --- jump navigation ---------------------------------------------------
+
+    /// The focused pane's current `(path, line, col)`, or `None` when its buffer
+    /// has no path (a scratch buffer can't be addressed by path). Used to snapshot
+    /// a jump origin and to seed `back`.
+    fn current_location(&self) -> Option<JumpPoint> {
+        let ed = &self.panes[self.focused];
+        let path = self.buffers[ed.buffer_id].path()?.to_path_buf();
+        let (line, col) = ed.cursor_line_col();
+        Some(JumpPoint::new(path, line, col))
+    }
+
+    /// Record the focused pane's current location as a jump origin, so a later
+    /// `back` can return here. A no-op for a pathless buffer.
+    fn record_jump(&mut self) {
+        if let Some(point) = self.current_location() {
+            self.jumps.record(point);
+        }
+    }
+
+    /// Navigate to `(line, col)` in `path`: open the file into the focused pane
+    /// if it isn't already there, then place the caret (clamped) and let the
+    /// next render reveal it. The single composition every jump feature reuses.
+    fn jump_to(&mut self, path: &Path, line: usize, col: usize) {
+        let already = self.buffers[self.panes[self.focused].buffer_id].path() == Some(path);
+        if !already {
+            self.open_in_focused_pane(path.to_path_buf());
+        }
+        let ed = &mut self.panes[self.focused];
+        let buffer = &self.buffers[ed.buffer_id];
+        ed.set_cursor(buffer, line, col);
+    }
+
+    /// `F11`: return to the previous location in the jump history.
+    fn jump_back(&mut self) {
+        let Some(current) = self.current_location() else {
+            return;
+        };
+        if let Some(p) = self.jumps.back(current) {
+            self.jump_to(&p.path.clone(), p.line, p.col);
+        }
+    }
+
+    /// `Shift+F11`: re-advance to the next location in the jump history.
+    fn jump_forward(&mut self) {
+        if let Some(p) = self.jumps.forward() {
+            self.jump_to(&p.path.clone(), p.line, p.col);
         }
     }
 
@@ -1004,6 +1072,8 @@ impl App {
                     if let Ok(n) = m.input.trim().parse::<usize>()
                         && n >= 1
                     {
+                        // Record where we jumped from, so `F11` returns here.
+                        self.record_jump();
                         let ed = &mut self.panes[self.focused];
                         let buffer = &self.buffers[ed.buffer_id];
                         ed.goto_line(buffer, n);
@@ -1016,6 +1086,8 @@ impl App {
                         .as_ref()
                         .and_then(FileFinder::selected_path)
                     {
+                        // Record the origin before leaving for another file.
+                        self.record_jump();
                         self.open_in_focused_pane(path);
                     }
                 }
@@ -1915,6 +1987,119 @@ mod tests {
         app.on_key(press(KeyCode::Enter, KeyModifiers::NONE));
         assert_eq!(app.buffers.len(), before);
         assert_eq!(app.focus, Focus::Editor);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // --- jump navigation ---------------------------------------------------
+
+    /// A workspace with two files: `alpha.rs` (10 lines) opened as the initial
+    /// buffer, and `bravo.rs` (2 lines) reachable via the finder.
+    fn jump_fixture(tag: &str) -> (App, PathBuf, PathBuf, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("vybim_jump_{}_{tag}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let alpha = dir.join("alpha.rs");
+        let bravo = dir.join("bravo.rs");
+        std::fs::write(&alpha, "l0\nl1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\nl9").unwrap();
+        std::fs::write(&bravo, "bravo0\nbravo1").unwrap();
+        let app = App::new(Buffer::from_path(&alpha).unwrap(), &dir);
+        (app, dir, alpha, bravo)
+    }
+
+    fn focused_path(app: &App) -> PathBuf {
+        app.buffers[app.panes[app.focused].buffer_id]
+            .path()
+            .unwrap()
+            .to_path_buf()
+    }
+
+    fn focused_line(app: &App) -> usize {
+        app.panes[app.focused].cursor.line
+    }
+
+    /// Commit a go-to-line through the real minibuffer path (records an origin).
+    fn goto_line_commit(app: &mut App, n: &str) {
+        app.open_goto_line();
+        app.minibuffer.as_mut().unwrap().input = n.to_string();
+        app.close_minibuffer_commit();
+    }
+
+    /// Open a file through the real fuzzy finder (records an origin).
+    fn finder_open(app: &mut App, query: &str) {
+        app.on_key(press(KeyCode::Char('p'), KeyModifiers::CONTROL));
+        for c in query.chars() {
+            app.on_key(press(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        app.on_key(press(KeyCode::Enter, KeyModifiers::NONE));
+    }
+
+    #[test]
+    fn back_and_forward_walk_across_files() {
+        let (mut app, dir, alpha, bravo) = jump_fixture("walk");
+
+        // Deep jump within alpha, then open bravo — each records an origin.
+        goto_line_commit(&mut app, "8");
+        assert_eq!(focused_line(&app), 7);
+        finder_open(&mut app, "bravo");
+        assert_eq!(focused_path(&app), bravo);
+
+        // F11 returns to alpha at the recorded deep line, then to its earlier line.
+        app.on_key(press(KeyCode::F(11), KeyModifiers::NONE));
+        assert_eq!(focused_path(&app), alpha);
+        assert_eq!(focused_line(&app), 7);
+        app.on_key(press(KeyCode::F(11), KeyModifiers::NONE));
+        assert_eq!(focused_path(&app), alpha);
+        assert_eq!(focused_line(&app), 0);
+
+        // Shift+F11 re-advances toward bravo: alpha line 7, then bravo.
+        app.on_key(press(KeyCode::F(11), KeyModifiers::SHIFT));
+        assert_eq!(focused_line(&app), 7);
+        app.on_key(press(KeyCode::F(11), KeyModifiers::SHIFT));
+        assert_eq!(focused_path(&app), bravo);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn jump_to_opens_unloaded_file_and_clamps_position() {
+        let (mut app, dir, _alpha, bravo) = jump_fixture("jt");
+        // bravo is not open yet; jump_to loads it and clamps an out-of-range pos.
+        app.jump_to(&bravo, 999, 999);
+        assert_eq!(focused_path(&app), bravo);
+        // bravo has 2 lines ("bravo0" / "bravo1"): clamps to the last line and
+        // that line's length.
+        assert_eq!(focused_line(&app), 1);
+        assert_eq!(app.panes[app.focused].cursor.col, "bravo1".chars().count());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn jump_keys_are_noops_with_empty_history() {
+        let (mut app, dir, alpha, _bravo) = jump_fixture("empty");
+        let before = app.buffers.len();
+        app.on_key(press(KeyCode::F(11), KeyModifiers::NONE));
+        app.on_key(press(KeyCode::F(11), KeyModifiers::SHIFT));
+        assert_eq!(focused_path(&app), alpha);
+        assert_eq!(focused_line(&app), 0);
+        assert_eq!(app.buffers.len(), before); // nothing opened
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn new_jump_after_back_discards_forward_branch() {
+        let (mut app, dir, alpha, _bravo) = jump_fixture("discard");
+        goto_line_commit(&mut app, "5"); // origin: alpha line 0
+        finder_open(&mut app, "bravo"); // origin: alpha line 4
+        app.on_key(press(KeyCode::F(11), KeyModifiers::NONE)); // back to alpha line 4
+        assert_eq!(focused_path(&app), alpha);
+        assert_eq!(focused_line(&app), 4);
+
+        // A divergent jump abandons the forward branch (bravo).
+        goto_line_commit(&mut app, "2");
+        assert_eq!(focused_line(&app), 1);
+        app.on_key(press(KeyCode::F(11), KeyModifiers::SHIFT)); // forward: no-op now
+        assert_eq!(focused_path(&app), alpha);
+        assert_eq!(focused_line(&app), 1);
+
         std::fs::remove_dir_all(&dir).ok();
     }
 

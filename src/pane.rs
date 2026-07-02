@@ -674,6 +674,25 @@ impl EditorPane {
         self.anchor = None;
     }
 
+    /// The primary caret's current `(line, col)`, for snapshotting a jump origin.
+    pub fn cursor_line_col(&self) -> (usize, usize) {
+        (self.cursor.line, self.cursor.col)
+    }
+
+    /// Move the primary caret to `(line, col)`, clamped into `buffer` (line to
+    /// the last line, col to that line's length), clearing any selection and
+    /// collapsing secondary carets. The next render reveals the caret via the
+    /// same scroll-into-view path that go-to-line and search already use.
+    pub fn set_cursor(&mut self, buffer: &Buffer, line: usize, col: usize) {
+        self.collapse_carets();
+        let line = line.min(self.last_line(buffer));
+        let col = col.min(self.line_len(buffer, line));
+        self.cursor.line = line;
+        self.cursor.col = col;
+        self.cursor.target_col = col;
+        self.anchor = None;
+    }
+
     // --- autocomplete ------------------------------------------------------
 
     /// Accept a completion: replace the word-prefix spanning from `prefix_start`
@@ -1522,6 +1541,27 @@ mod tests {
         assert_eq!(p.cursor.line, 3);
         p.goto_line(&b, 1);
         assert_eq!(p.cursor.line, 0);
+    }
+
+    #[test]
+    fn set_cursor_clamps_line_and_col() {
+        let (mut p, b) = setup("ab\ncdef\ng");
+        p.set_cursor(&b, 1, 3);
+        assert_eq!((p.cursor.line, p.cursor.col), (1, 3));
+        // Line past the end lands on the last line; col past the end lands on
+        // that line's length.
+        p.set_cursor(&b, 999, 999);
+        assert_eq!((p.cursor.line, p.cursor.col), (2, 1));
+        assert_eq!(p.cursor.target_col, 1);
+    }
+
+    #[test]
+    fn set_cursor_clears_selection() {
+        let (mut p, b) = setup("hello\nworld");
+        p.move_right(&b, true); // start a selection
+        assert!(p.has_selection());
+        p.set_cursor(&b, 1, 0);
+        assert!(!p.has_selection());
     }
 
     // --- multi-cursor ------------------------------------------------------
