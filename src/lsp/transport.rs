@@ -5,7 +5,7 @@
 
 use std::io::{self, Read, Write};
 use std::path::Path;
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::Sender;
 use std::thread;
 
@@ -73,10 +73,20 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 }
 
 /// A live connection to a language server subprocess.
-#[derive(Debug)]
+/// A live connection to a language server subprocess. The writer is boxed so
+/// tests can substitute an in-memory sink for the child's stdin.
 pub struct Connection {
-    child: Child,
-    stdin: ChildStdin,
+    /// Held to own the subprocess handle for the connection's lifetime; the
+    /// server is stopped via `shutdown`/`exit`, not by dropping this.
+    #[allow(dead_code)]
+    child: Option<Child>,
+    writer: Box<dyn Write + Send>,
+}
+
+impl std::fmt::Debug for Connection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Connection").finish_non_exhaustive()
+    }
 }
 
 impl Connection {
@@ -138,20 +148,44 @@ impl Connection {
             });
         }
 
-        Ok(Connection { child, stdin })
+        Ok(Connection {
+            child: Some(child),
+            writer: Box::new(stdin),
+        })
+    }
+
+    /// A connection with no subprocess whose writes land in `sink`, for tests.
+    #[cfg(test)]
+    pub fn for_test(sink: TestSink) -> Connection {
+        Connection {
+            child: None,
+            writer: Box::new(sink),
+        }
     }
 
     /// Frame and write an outgoing message body to the server's stdin.
     /// Fire-and-forget: small writes on the main thread for v1.
     pub fn send(&mut self, body: &Value) -> io::Result<()> {
         let bytes = serde_json::to_vec(body)?;
-        self.stdin.write_all(&frame(&bytes))?;
-        self.stdin.flush()
+        self.writer.write_all(&frame(&bytes))?;
+        self.writer.flush()
     }
+}
 
-    /// Terminate the subprocess (used if it must be force-stopped).
-    pub fn kill(&mut self) {
-        let _ = self.child.kill();
+/// An in-memory, shareable sink capturing framed bytes written to a test
+/// [`Connection`], so a test can decode what the client sent.
+#[cfg(test)]
+#[derive(Clone, Default)]
+pub struct TestSink(pub std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+#[cfg(test)]
+impl Write for TestSink {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
     }
 }
 

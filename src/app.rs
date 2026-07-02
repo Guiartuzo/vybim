@@ -28,6 +28,7 @@ use crate::file_find::{self, FileItem};
 use crate::file_tree::FileTree;
 use crate::jump::{JumpList, JumpPoint};
 use crate::lsp::Lsp;
+use crate::lsp::client::PendingKind;
 use crate::minibuffer::{MiniMode, Minibuffer};
 use crate::pane::EditorPane;
 use crate::syntax::Syntax;
@@ -161,6 +162,11 @@ const BINDINGS: &[KeyBinding] = &[
         group: "Editor",
         keys: "Shift+F11",
         action: "Jump forward",
+    },
+    KeyBinding {
+        group: "Editor",
+        keys: "F12",
+        action: "Go to definition",
     },
     KeyBinding {
         group: "Editor",
@@ -486,10 +492,14 @@ impl App {
             AppEvent::PtyOutput(id, bytes) => self.feed_terminal(id, &bytes),
             AppEvent::PtyExit(id) => self.on_terminal_exit(id),
             AppEvent::Lsp(id, msg) => {
-                // v1 consumes only the `initialize` handshake internally; other
-                // responses route back via the return value (no consumer until
-                // go-to-definition), and notifications are stored/ignored.
-                let _ = self.lsp.handle_message(id, msg);
+                // The `initialize` handshake is consumed inside the manager;
+                // feature responses route back here via the return value.
+                if let Some(resp) = self.lsp.handle_message(id, msg) {
+                    match resp.kind {
+                        PendingKind::Definition => self.apply_definition(resp.result),
+                        PendingKind::Initialize => {}
+                    }
+                }
             }
             AppEvent::LspExit(id) => self.lsp.mark_exited(id),
         }
@@ -739,6 +749,8 @@ impl App {
             // go-to-definition). Shift variant matched first.
             KeyCode::F(11) if shift => return self.jump_forward(),
             KeyCode::F(11) => return self.jump_back(),
+            // Go to definition (VSCode-style); pairs with F11 back.
+            KeyCode::F(12) => return self.goto_definition(),
             // Autocomplete trigger: `Ctrl+N` (reliable) plus a best-effort
             // `Ctrl+Space` alias (reported as `Char(' ')`+Ctrl or `Null`).
             KeyCode::Char('n') if ctrl => return self.open_completion(),
@@ -883,6 +895,68 @@ impl App {
         self.last_lsp_sync = Some(now);
         let text = self.buffers[ed.buffer_id].text();
         self.lsp.notify_changed(&path, &text);
+    }
+
+    // --- go to definition --------------------------------------------------
+
+    /// `F12`: ask the focused buffer's language server for the definition at the
+    /// cursor. A quiet no-op when no definition-capable server is running.
+    fn goto_definition(&mut self) {
+        let ed = &self.panes[self.focused];
+        let buffer = &self.buffers[ed.buffer_id];
+        let Some(path) = buffer.path().map(Path::to_path_buf) else {
+            return;
+        };
+        let Some(language) = crate::lsp::registry::language_of(&path) else {
+            return;
+        };
+        let (line, col) = ed.cursor_line_col();
+        let pos = crate::lsp::protocol::to_lsp_position(buffer, line, col);
+        let uri = crate::lsp::protocol::path_to_uri(&path);
+
+        let body = {
+            let Some(server) = self.lsp.server_mut(language) else {
+                return;
+            };
+            if !server.supports_definition() {
+                return;
+            }
+            // Invalidate any earlier in-flight definition request; only the
+            // latest cursor position matters.
+            server.supersede(PendingKind::Definition);
+            let params = serde_json::json!({
+                "textDocument": { "uri": uri },
+                "position": { "line": pos.line, "character": pos.character },
+            });
+            let (_id, body) =
+                server.request("textDocument/definition", params, PendingKind::Definition);
+            body
+        };
+        self.lsp.send(language, body);
+    }
+
+    /// Route a `textDocument/definition` response into a jump: record the press
+    /// site (so `F11` returns), then navigate to the primary target location.
+    fn apply_definition(&mut self, result: Option<serde_json::Value>) {
+        let Some(result) = result else {
+            return;
+        };
+        let Some((uri, pos, count)) = crate::lsp::protocol::primary_definition(&result) else {
+            return;
+        };
+        let Some(path) = crate::lsp::protocol::uri_to_path(&uri) else {
+            return;
+        };
+        // Record where F12 was pressed, then open the target (loading its text
+        // so the UTF-16→char conversion below uses the right line).
+        self.record_jump();
+        self.jump_to(&path, pos.line as usize, 0);
+        let idx = self.panes[self.focused].buffer_id;
+        let (line, col) = crate::lsp::protocol::from_lsp_position(&self.buffers[idx], pos);
+        self.panes[self.focused].set_cursor(&self.buffers[idx], line, col);
+        if count > 1 {
+            self.lsp.status = Some(format!("{count} definitions — showing first"));
+        }
     }
 
     // --- jump navigation ---------------------------------------------------
@@ -2186,6 +2260,149 @@ mod tests {
         assert_eq!(focused_path(&app), alpha);
         assert_eq!(focused_line(&app), 1);
 
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // --- go to definition --------------------------------------------------
+
+    fn definition_request_positions(
+        sink: &crate::lsp::transport::TestSink,
+    ) -> Vec<serde_json::Value> {
+        Lsp::sent_messages(sink)
+            .into_iter()
+            .filter_map(|m| match m {
+                crate::lsp::Message::Request { method, params, .. }
+                    if method == "textDocument/definition" =>
+                {
+                    Some(params)
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn f12_issues_a_definition_request_at_the_cursor() {
+        let (mut app, dir, _alpha, _bravo) = jump_fixture("gd_issue");
+        app.panes[0].set_cursor(&app.buffers[0], 3, 1);
+        let (_id, sink) = app
+            .lsp
+            .install_test_server("rust", serde_json::json!({ "definitionProvider": true }));
+        app.on_key(press(KeyCode::F(12), KeyModifiers::NONE));
+        let reqs = definition_request_positions(&sink);
+        assert_eq!(reqs.len(), 1);
+        assert_eq!(reqs[0]["position"]["line"], 3);
+        assert_eq!(reqs[0]["position"]["character"], 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn f12_is_a_noop_without_a_running_server() {
+        let (mut app, dir, alpha, _bravo) = jump_fixture("gd_noserver");
+        app.on_key(press(KeyCode::F(12), KeyModifiers::NONE));
+        assert_eq!(focused_path(&app), alpha); // unchanged, no panic
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn f12_is_a_noop_without_definition_capability() {
+        let (mut app, dir, _alpha, _bravo) = jump_fixture("gd_nocap");
+        let (_id, sink) = app.lsp.install_test_server("rust", serde_json::json!({}));
+        app.on_key(press(KeyCode::F(12), KeyModifiers::NONE));
+        assert!(definition_request_positions(&sink).is_empty());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn definition_response_navigates_and_f11_returns_to_the_press_site() {
+        let (mut app, dir, alpha, bravo) = jump_fixture("gd_nav");
+        app.panes[0].set_cursor(&app.buffers[0], 2, 0); // press site
+        let result = serde_json::json!({
+            "uri": crate::lsp::protocol::path_to_uri(&bravo),
+            "range": { "start": { "line": 1, "character": 0 }, "end": { "line": 1, "character": 0 } }
+        });
+        app.apply_definition(Some(result));
+        assert_eq!(focused_path(&app), bravo);
+        assert_eq!(focused_line(&app), 1);
+
+        app.on_key(press(KeyCode::F(11), KeyModifiers::NONE));
+        assert_eq!(focused_path(&app), alpha);
+        assert_eq!(focused_line(&app), 2);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn null_definition_is_a_noop_and_multi_result_takes_the_first() {
+        let (mut app, dir, alpha, bravo) = jump_fixture("gd_multi");
+        app.panes[0].set_cursor(&app.buffers[0], 0, 0);
+        app.apply_definition(Some(serde_json::Value::Null));
+        app.apply_definition(None);
+        assert_eq!(focused_path(&app), alpha); // both no-ops
+
+        let result = serde_json::json!([
+            { "uri": crate::lsp::protocol::path_to_uri(&bravo),
+              "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 0, "character": 0 } } },
+            { "uri": crate::lsp::protocol::path_to_uri(&alpha),
+              "range": { "start": { "line": 5, "character": 0 }, "end": { "line": 5, "character": 0 } } }
+        ]);
+        app.apply_definition(Some(result));
+        assert_eq!(focused_path(&app), bravo); // first entry
+        assert_eq!(focused_line(&app), 0);
+        assert_eq!(
+            app.lsp.status.as_deref(),
+            Some("2 definitions — showing first")
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn superseded_definition_response_is_dropped() {
+        let (mut app, dir, alpha, bravo) = jump_fixture("gd_supersede");
+        app.panes[0].set_cursor(&app.buffers[0], 2, 0);
+        let (server_id, sink) = app
+            .lsp
+            .install_test_server("rust", serde_json::json!({ "definitionProvider": true }));
+
+        // Two F12 presses: the second supersedes the first's pending request.
+        app.on_key(press(KeyCode::F(12), KeyModifiers::NONE));
+        app.on_key(press(KeyCode::F(12), KeyModifiers::NONE));
+        let ids: Vec<_> = Lsp::sent_messages(&sink)
+            .into_iter()
+            .filter_map(|m| match m {
+                crate::lsp::Message::Request { id, method, .. }
+                    if method == "textDocument/definition" =>
+                {
+                    Some(id)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ids.len(), 2);
+
+        let def = serde_json::json!({
+            "uri": crate::lsp::protocol::path_to_uri(&bravo),
+            "range": { "start": { "line": 1, "character": 0 }, "end": { "line": 1, "character": 0 } }
+        });
+        // The stale (first) response is dropped — no navigation.
+        app.handle_app_event(AppEvent::Lsp(
+            server_id,
+            crate::lsp::Message::Response {
+                id: ids[0].clone(),
+                result: Some(def.clone()),
+                error: None,
+            },
+        ));
+        assert_eq!(focused_path(&app), alpha);
+        // The current (second) response navigates.
+        app.handle_app_event(AppEvent::Lsp(
+            server_id,
+            crate::lsp::Message::Response {
+                id: ids[1].clone(),
+                result: Some(def),
+                error: None,
+            },
+        ));
+        assert_eq!(focused_path(&app), bravo);
         std::fs::remove_dir_all(&dir).ok();
     }
 

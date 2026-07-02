@@ -2,6 +2,8 @@
 //! boundary. Payloads are carried as `serde_json::Value` so this layer stays
 //! protocol-generic; feature code deserializes into `lsp_types` structs.
 
+use std::path::{Path, PathBuf};
+
 use lsp_types::Position;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -107,6 +109,66 @@ pub fn notification_body(method: &str, params: Value) -> Value {
     })
 }
 
+/// A `file://` URI for a local path, percent-encoding characters that need it
+/// (spaces, etc.). The single canonical encoding, used for both the documents
+/// we sync and the requests we issue, so a server keys them identically.
+pub fn path_to_uri(path: &Path) -> String {
+    let s = path.to_string_lossy();
+    let mut out = String::from("file://");
+    for b in s.bytes() {
+        match b {
+            b'/' | b'-' | b'.' | b'_' | b'~' => out.push(b as char),
+            b if b.is_ascii_alphanumeric() => out.push(b as char),
+            b => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+/// Resolve a `file://` URI back to a filesystem path, undoing percent-encoding.
+pub fn uri_to_path(uri: &str) -> Option<PathBuf> {
+    let rest = uri.strip_prefix("file://")?;
+    let mut bytes = Vec::with_capacity(rest.len());
+    let raw = rest.as_bytes();
+    let mut i = 0;
+    while i < raw.len() {
+        if raw[i] == b'%' && i + 2 < raw.len() {
+            let hi = (raw[i + 1] as char).to_digit(16)?;
+            let lo = (raw[i + 2] as char).to_digit(16)?;
+            bytes.push((hi * 16 + lo) as u8);
+            i += 3;
+        } else {
+            bytes.push(raw[i]);
+            i += 1;
+        }
+    }
+    Some(PathBuf::from(String::from_utf8(bytes).ok()?))
+}
+
+/// Parse a `textDocument/definition` result — which may be a single
+/// `Location`, an array of them, or `LocationLink[]` — into the primary
+/// target `(uri, start position)` and the total count. `None` for a
+/// null/empty result.
+pub fn primary_definition(result: &Value) -> Option<(String, Position, usize)> {
+    use lsp_types::GotoDefinitionResponse as R;
+    let resp: R = serde_json::from_value(result.clone()).ok()?;
+    Some(match resp {
+        R::Scalar(loc) => (loc.uri.to_string(), loc.range.start, 1),
+        R::Array(locs) => {
+            let first = locs.first()?;
+            (first.uri.to_string(), first.range.start, locs.len())
+        }
+        R::Link(links) => {
+            let first = links.first()?;
+            (
+                first.target_uri.to_string(),
+                first.target_range.start,
+                links.len(),
+            )
+        }
+    })
+}
+
 /// Convert a Vybim `(line, char-col)` into an LSP position (UTF-16 column).
 pub fn to_lsp_position(buffer: &Buffer, line: usize, col: usize) -> Position {
     Position {
@@ -184,6 +246,19 @@ mod tests {
         assert_eq!(pos.character, 3);
         // And back: UTF-16 unit 3 maps to char col 2.
         assert_eq!(from_lsp_position(&b, pos), (0, 2));
+    }
+
+    #[test]
+    fn uri_path_roundtrips_including_spaces() {
+        let p = Path::new("/tmp/my project/src/a.rs");
+        let uri = path_to_uri(p);
+        assert_eq!(uri, "file:///tmp/my%20project/src/a.rs");
+        assert_eq!(uri_to_path(&uri).as_deref(), Some(p));
+        // A plain path round-trips untouched.
+        let q = Path::new("/home/u/x.rs");
+        assert_eq!(uri_to_path(&path_to_uri(q)).as_deref(), Some(q));
+        // Non-file URIs are rejected.
+        assert!(uri_to_path("http://example.com").is_none());
     }
 
     #[test]

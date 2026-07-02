@@ -26,9 +26,7 @@ pub enum PendingKind {
 #[derive(Debug)]
 pub struct Server {
     pub id: usize,
-    pub language: String,
     pub capabilities: Option<ServerCapabilities>,
-    pub alive: bool,
     ids: IdSource,
     pending: HashMap<RequestId, PendingKind>,
     /// Open documents by URI → last synced version.
@@ -36,12 +34,10 @@ pub struct Server {
 }
 
 impl Server {
-    pub fn new(id: usize, language: impl Into<String>) -> Self {
+    pub fn new(id: usize) -> Self {
         Self {
             id,
-            language: language.into(),
             capabilities: None,
-            alive: true,
             ids: IdSource::default(),
             pending: HashMap::new(),
             open_docs: HashMap::new(),
@@ -159,9 +155,10 @@ impl Server {
     }
 }
 
-/// A `file://` URI for a local path (Unix-oriented; adequate for v1).
+/// A `file://` URI for a local path — the canonical, percent-encoded encoding
+/// (so the URI we sync a document under matches the one a request carries).
 pub fn file_uri(path: &Path) -> String {
-    format!("file://{}", path.display())
+    crate::lsp::protocol::path_to_uri(path)
 }
 
 #[cfg(test)]
@@ -169,7 +166,7 @@ mod tests {
     use super::*;
 
     fn served() -> Server {
-        Server::new(0, "rust")
+        Server::new(0)
     }
 
     #[test]

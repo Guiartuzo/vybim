@@ -1,11 +1,6 @@
-//! A generic, language-agnostic LSP client.
-//!
-//! This is the substrate the language features build on; it ships **no**
-//! user-facing feature by itself (the first consumer is the go-to-definition
-//! change). Some of the API here is therefore forward-declared for that
-//! consumer, hence the module-wide `dead_code` allowance below — it is removed
-//! once the feature lands and exercises the request/supersede/position paths.
-#![allow(dead_code)]
+//! A generic, language-agnostic LSP client — the substrate the language
+//! features build on. The go-to-definition feature is its first consumer,
+//! exercising the request/supersede/position paths.
 
 pub mod client;
 pub mod protocol;
@@ -53,11 +48,9 @@ impl Running {
 }
 
 /// A response routed back to the feature that issued the request, for the main
-/// loop to act on. (No consumer in this change beyond the internal
-/// `initialize` handling; go-to-definition consumes the `Definition` arm.)
+/// loop to act on (go-to-definition consumes the `Definition` arm).
 #[derive(Debug)]
 pub struct Response {
-    pub language: String,
     pub kind: PendingKind,
     pub result: Option<Value>,
 }
@@ -101,7 +94,7 @@ impl Lsp {
         let log = std::fs::File::create(self.log_dir.join(format!("{language}.log"))).ok();
         match Connection::spawn(id, &cmd, root, tx.clone(), log) {
             Ok(mut conn) => {
-                let mut server = Server::new(id, language);
+                let mut server = Server::new(id);
                 // `initialize` is the one message allowed before `initialized`.
                 let _ = conn.send(&server.initialize(root));
                 self.servers.insert(
@@ -167,8 +160,50 @@ impl Lsp {
     }
 
     /// How many servers are currently running (used in tests to assert inertness).
+    #[cfg(test)]
     pub fn running_count(&self) -> usize {
         self.servers.len()
+    }
+
+    /// Install a ready, capture-backed server for `language` with the given
+    /// capabilities, bypassing a real subprocess. Returns its id and the sink
+    /// that captures everything the client sends it.
+    #[cfg(test)]
+    pub fn install_test_server(
+        &mut self,
+        language: &str,
+        capabilities: Value,
+    ) -> (usize, transport::TestSink) {
+        let id = self.next_id;
+        self.next_id += 1;
+        let sink = transport::TestSink::default();
+        let mut server = Server::new(id);
+        server.capabilities = serde_json::from_value(capabilities).ok();
+        self.servers.insert(
+            language.to_string(),
+            Running {
+                server,
+                conn: Connection::for_test(sink.clone()),
+                ready: true,
+                queued: Vec::new(),
+            },
+        );
+        (id, sink)
+    }
+
+    /// Decode every message the client wrote to a test sink.
+    #[cfg(test)]
+    pub fn sent_messages(sink: &transport::TestSink) -> Vec<Message> {
+        let bytes = sink.0.lock().unwrap().clone();
+        let mut decoder = transport::FrameDecoder::new();
+        decoder.push(&bytes);
+        let mut out = Vec::new();
+        while let Some(body) = decoder.next_body() {
+            if let Some(msg) = Message::from_json(&body) {
+                out.push(msg);
+            }
+        }
+        out
     }
 
     /// A server for `language`, if running — for a feature to issue a request.
@@ -187,7 +222,7 @@ impl Lsp {
     /// (store capabilities, send `initialized`, flush the queue); other
     /// responses are routed back to their feature via the returned [`Response`].
     pub fn handle_message(&mut self, server_id: usize, msg: Message) -> Option<Response> {
-        let (language, running) = self.by_id_mut(server_id)?;
+        let (_language, running) = self.by_id_mut(server_id)?;
         match msg {
             Message::Response { id, result, error } => {
                 let kind = running.server.on_response(&id)?;
@@ -200,7 +235,6 @@ impl Lsp {
                         None
                     }
                     other => Some(Response {
-                        language,
                         kind: other,
                         // Surface an error result as `None` (no location).
                         result: if error.is_some() { None } else { result },
