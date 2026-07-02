@@ -155,12 +155,12 @@ const BINDINGS: &[KeyBinding] = &[
     },
     KeyBinding {
         group: "Editor",
-        keys: "F11 / Alt+,",
+        keys: "F11 / Alt+-",
         action: "Jump back",
     },
     KeyBinding {
         group: "Editor",
-        keys: "Shift+F11 / Alt+.",
+        keys: "Shift+F11 / Alt+=",
         action: "Jump forward",
     },
     KeyBinding {
@@ -746,13 +746,14 @@ impl App {
             KeyCode::Left if alt => return self.focus_prev(),
             KeyCode::Right if alt => return self.focus_next(),
             // Jump history: F11 back, Shift+F11 forward (pairs with F12
-            // go-to-definition). Shift variant matched first. `Alt+,` / `Alt+.`
+            // go-to-definition). Shift variant matched first. `Alt+-` / `Alt+=`
             // are VTE-safe aliases for terminals that swallow F11 (e.g.
-            // gnome-terminal binds it to fullscreen).
+            // gnome-terminal binds it to fullscreen); minus steps back, equals
+            // steps forward.
             KeyCode::F(11) if shift => return self.jump_forward(),
             KeyCode::F(11) => return self.jump_back(),
-            KeyCode::Char(',') if alt => return self.jump_back(),
-            KeyCode::Char('.') if alt => return self.jump_forward(),
+            KeyCode::Char('-') if alt => return self.jump_back(),
+            KeyCode::Char('=') if alt => return self.jump_forward(),
             // Go to definition (VSCode-style); pairs with F11 back.
             KeyCode::F(12) => return self.goto_definition(),
             // Autocomplete trigger: `Ctrl+N` (reliable) plus a best-effort
@@ -2224,19 +2225,19 @@ mod tests {
     }
 
     #[test]
-    fn alt_comma_and_alt_dot_are_back_forward_aliases() {
-        // VTE-safe fallback for terminals that capture F11: Alt+, / Alt+.
+    fn alt_minus_and_alt_equals_are_back_forward_aliases() {
+        // VTE-safe fallback for terminals that capture F11: Alt+- / Alt+=.
         let (mut app, dir, alpha, bravo) = jump_fixture("alt_alias");
         goto_line_commit(&mut app, "8");
         finder_open(&mut app, "bravo");
         assert_eq!(focused_path(&app), bravo);
 
-        // Alt+, steps back to alpha at the recorded deep line.
-        app.on_key(press(KeyCode::Char(','), KeyModifiers::ALT));
+        // Alt+- steps back to alpha at the recorded deep line.
+        app.on_key(press(KeyCode::Char('-'), KeyModifiers::ALT));
         assert_eq!(focused_path(&app), alpha);
         assert_eq!(focused_line(&app), 7);
-        // Alt+. re-advances toward bravo.
-        app.on_key(press(KeyCode::Char('.'), KeyModifiers::ALT));
+        // Alt+= re-advances toward bravo.
+        app.on_key(press(KeyCode::Char('='), KeyModifiers::ALT));
         assert_eq!(focused_path(&app), bravo);
         std::fs::remove_dir_all(&dir).ok();
     }
