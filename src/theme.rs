@@ -1,4 +1,4 @@
-//! The UI theme: a single source of truth for every chrome color NyxVim draws.
+//! The UI theme: a single source of truth for every chrome color Vybim draws.
 //!
 //! Before this module, ~70 `Color::` literals were scattered across eight files,
 //! and the "blue if focused, dark-gray if not" selection rule was copy-pasted in
@@ -55,7 +55,7 @@ pub struct Theme {
 }
 
 impl Default for Theme {
-    /// The default theme: NyxVim's original terminal-color palette (the values in
+    /// The default theme: Vybim's original terminal-color palette (the values in
     /// use before the Charm/teal experiments). These map onto the standard 16/256
     /// palette so they read on most terminals. The look is determined here (and in
     /// [`Theme::border_type`]), so the palette can be changed in one place.

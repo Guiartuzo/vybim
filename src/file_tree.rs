@@ -2,7 +2,7 @@
 //! selection.
 //!
 //! Each directory's children are read only when it is first expanded, so
-//! opening NyxVim in a large repository stays instant. The tree is rendered by
+//! opening Vybim in a large repository stays instant. The tree is rendered by
 //! flattening the expanded nodes into a list of visible rows.
 
 use std::path::{Path, PathBuf};
@@ -255,7 +255,7 @@ mod tests {
     ///       b.txt
     fn fixture() -> PathBuf {
         let root = std::env::temp_dir().join(format!(
-            "nyxvim_tree_{}_{}",
+            "vybim_tree_{}_{}",
             std::process::id(),
             // a counter so repeated calls don't collide
             std::time::SystemTime::now()

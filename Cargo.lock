@@ -781,22 +781,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "nyxvim"
-version = "0.1.0"
-dependencies = [
- "crossterm",
- "portable-pty",
- "ratatui",
- "ropey",
- "similar",
- "tree-sitter",
- "tree-sitter-highlight",
- "tree-sitter-rust",
- "vt100",
- "walkdir",
-]
-
-[[package]]
 name = "once_cell"
 version = "1.21.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1726,6 +1710,22 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6d9b2acfb050df409c972a37d3b8e08cdea3bddb0c09db9d53137e504cfabed0"
 dependencies = [
  "utf8parse",
+]
+
+[[package]]
+name = "vybim"
+version = "0.1.0"
+dependencies = [
+ "crossterm",
+ "portable-pty",
+ "ratatui",
+ "ropey",
+ "similar",
+ "tree-sitter",
+ "tree-sitter-highlight",
+ "tree-sitter-rust",
+ "vt100",
+ "walkdir",
 ]
 
 [[package]]

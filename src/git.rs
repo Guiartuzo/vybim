@@ -245,7 +245,7 @@ mod tests {
     /// the previous directory. Skipped silently if `git` is unavailable.
     #[test]
     fn end_to_end_against_a_temp_repo() {
-        let dir = std::env::temp_dir().join(format!("nyxvim_git_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("vybim_git_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
 

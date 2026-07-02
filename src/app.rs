@@ -343,7 +343,7 @@ impl FileFinder {
     }
 }
 
-/// Central application state — the single owner of everything NyxVim tracks.
+/// Central application state — the single owner of everything Vybim tracks.
 #[derive(Debug)]
 pub struct App {
     should_quit: bool,
@@ -1199,7 +1199,7 @@ fn render_help_overlay(frame: &mut Frame, theme: &Theme) {
     let block = theme
         .block(Borders::ALL)
         .border_style(Style::new().fg(theme.focus_bg))
-        .title(" NyxVim — Keybindings ");
+        .title(" Vybim — Keybindings ");
     frame.render_widget(Clear, area);
     frame.render_widget(Paragraph::new(Text::from(lines)).block(block), area);
 }
@@ -1428,7 +1428,7 @@ mod tests {
 
     #[test]
     fn opening_a_file_adds_buffer_and_focuses_editor() {
-        let dir = std::env::temp_dir().join(format!("nyxvim_open_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("vybim_open_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("note.txt");
         std::fs::write(&file, "from disk").unwrap();
@@ -1861,7 +1861,7 @@ mod tests {
     /// An app rooted at a fresh temp fixture holding `src/main.rs` and
     /// `README.md`. Returns the app and its root (caller removes it).
     fn fixture_app(tag: &str) -> (App, std::path::PathBuf) {
-        let dir = std::env::temp_dir().join(format!("nyxvim_finder_{}_{tag}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("vybim_finder_{}_{tag}", std::process::id()));
         std::fs::create_dir_all(dir.join("src")).unwrap();
         std::fs::write(dir.join("src/main.rs"), "fn main() {}").unwrap();
         std::fs::write(dir.join("README.md"), "# hi").unwrap();

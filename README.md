@@ -1,6 +1,9 @@
-# NyxVim
+# Vybim
 
-[![CI](https://github.com/Guiartuzo/NyxVim/actions/workflows/rust.yml/badge.svg)](https://github.com/Guiartuzo/NyxVim/actions/workflows/rust.yml)
+> *Vybim — a vibe-coded, "vim-style" text editor.*
+> (It's actually **modeless**. The name just packs vibe, vim, and vigor into five letters.)
+
+[![CI](https://github.com/Guiartuzo/vybim/actions/workflows/rust.yml/badge.svg)](https://github.com/Guiartuzo/vybim/actions/workflows/rust.yml)
 
 A minimalist, **modeless** terminal code editor — fast and snappy like `nano`/`vim`,
 but with a familiar VSCode-style editing model (arrow keys move, `Shift+Arrow`
@@ -9,7 +12,7 @@ numbers, syntax highlighting, multiple cursors, word autocomplete, fuzzy file
 finding, an integrated terminal area (multiple terminals), and a side-by-side git
 diff view.
 
-![NyxVim demo](docs/demo.gif)
+![Vybim demo](docs/demo.gif)
 
 > Status: **MVP foundation.** AI integration — the long-term differentiator — is
 > deliberately deferred to a future change, as are a command palette and a plugin
@@ -18,12 +21,12 @@ diff view.
 ## Install
 
 Prebuilt binaries for **Linux, macOS, and Windows** are published on the
-[**Releases page**](https://github.com/Guiartuzo/NyxVim/releases) — download the
-archive for your OS, extract, and run `nyxvim`. No toolchain required.
+[**Releases page**](https://github.com/Guiartuzo/vybim/releases) — download the
+archive for your OS, extract, and run `vybim`. No toolchain required.
 
 ### Build from source
 
-NyxVim is written in Rust. With a Rust toolchain installed (`rustup`):
+Vybim is written in Rust. With a Rust toolchain installed (`rustup`):
 
 ```bash
 # Run, opening a file:
@@ -32,7 +35,7 @@ cargo run --release -- path/to/file.rs
 # Run in the current directory (empty buffer, sidebar shows the working dir):
 cargo run --release
 
-# Build a release binary at target/release/nyxvim:
+# Build a release binary at target/release/vybim:
 cargo build --release
 
 # Run the test suite:
@@ -97,7 +100,7 @@ list in-app (it is generated from one table, so it can't drift from this README)
 | `Ctrl+W` | Close the focused terminal |
 
 When a terminal is focused, keystrokes are forwarded to the shell (including
-`Ctrl+C`). The global and pane-management chords above are intercepted by NyxVim
+`Ctrl+C`). The global and pane-management chords above are intercepted by Vybim
 and do not reach the shell.
 
 ### Sidebar (file tree)
@@ -151,7 +154,7 @@ indirection keeps shared state simple (no `Rc<RefCell<>>`).
 
 - Syntax highlighting is computed per visible line, so multi-line constructs
   (block comments, multi-line strings) aren't tracked across line boundaries.
-- Tabs in files are not width-expanded for cursor placement (NyxVim inserts
+- Tabs in files are not width-expanded for cursor placement (Vybim inserts
   spaces for `Tab`).
 - Incremental search exists (`Ctrl+F`), but there is no search-and-replace UI.
 - Splits are vertical only; no editor tabs or horizontal splits.

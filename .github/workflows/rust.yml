@@ -58,11 +58,11 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
-            bin: nyxvim
+            bin: vybim
           - os: windows-latest
-            bin: nyxvim.exe
+            bin: vybim.exe
           - os: macos-latest
-            bin: nyxvim
+            bin: vybim
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -84,7 +84,7 @@ jobs:
       - name: Upload binary
         uses: actions/upload-artifact@v4
         with:
-          name: nyxvim-${{ matrix.os }}
+          name: vybim-${{ matrix.os }}
           path: target/release/${{ matrix.bin }}
 
   test:

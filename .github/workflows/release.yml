@@ -27,13 +27,13 @@ jobs:
         include:
           - os: ubuntu-latest
             target_label: linux-x86_64
-            bin: nyxvim
+            bin: vybim
           - os: macos-latest
             target_label: macos-arm64
-            bin: nyxvim
+            bin: vybim
           - os: windows-latest
             target_label: windows-x86_64
-            bin: nyxvim.exe
+            bin: vybim.exe
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -50,7 +50,7 @@ jobs:
         if: runner.os != 'Windows'
         shell: bash
         run: |
-          name="nyxvim-${GITHUB_REF_NAME}-${{ matrix.target_label }}"
+          name="vybim-${GITHUB_REF_NAME}-${{ matrix.target_label }}"
           tar -czf "${name}.tar.gz" -C target/release "${{ matrix.bin }}"
           echo "ASSET=${name}.tar.gz" >> "$GITHUB_ENV"
 
@@ -58,7 +58,7 @@ jobs:
         if: runner.os == 'Windows'
         shell: bash
         run: |
-          name="nyxvim-${GITHUB_REF_NAME}-${{ matrix.target_label }}"
+          name="vybim-${GITHUB_REF_NAME}-${{ matrix.target_label }}"
           7z a "${name}.zip" "./target/release/${{ matrix.bin }}"
           echo "ASSET=${name}.zip" >> "$GITHUB_ENV"
 

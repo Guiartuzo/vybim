@@ -1,6 +1,6 @@
 //! Terminal lifecycle: raw mode, the alternate screen, and panic-safe teardown.
 //!
-//! NyxVim takes over the terminal on startup and must always hand it back in a
+//! Vybim takes over the terminal on startup and must always hand it back in a
 //! usable state — on a normal quit, on an error, and even on a panic.
 
 use std::io::{self, Stdout};

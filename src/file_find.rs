@@ -5,7 +5,7 @@
 //! order anywhere in the path), not a substring — so `mn` finds `main.rs`.
 //! Matches are scored so that consecutive runs, filename hits, and word/path
 //! boundary starts rank higher, the same instinct VSCode's `Ctrl+P` follows.
-//! Case folding is ASCII-only, matching the rest of NyxVim's matching code.
+//! Case folding is ASCII-only, matching the rest of Vybim's matching code.
 
 use std::path::{Path, PathBuf};
 
@@ -208,7 +208,7 @@ mod tests {
 
     #[test]
     fn gather_files_skips_hidden_dirs() {
-        let root = std::env::temp_dir().join(format!("nyxvim_ff_{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("vybim_ff_{}", std::process::id()));
         std::fs::create_dir_all(root.join(".git")).unwrap();
         std::fs::create_dir_all(root.join("src")).unwrap();
         std::fs::write(root.join("src/main.rs"), "fn main() {}").unwrap();
