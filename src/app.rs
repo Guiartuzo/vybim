@@ -155,12 +155,12 @@ const BINDINGS: &[KeyBinding] = &[
     },
     KeyBinding {
         group: "Editor",
-        keys: "F11 / Alt+-",
+        keys: "F11 / Shift+F12",
         action: "Jump back",
     },
     KeyBinding {
         group: "Editor",
-        keys: "Shift+F11 / Alt+=",
+        keys: "Shift+F11 / Ctrl+F12",
         action: "Jump forward",
     },
     KeyBinding {
@@ -756,16 +756,15 @@ impl App {
             KeyCode::Char('p') if ctrl => return self.open_file_finder(),
             KeyCode::Left if alt => return self.focus_prev(),
             KeyCode::Right if alt => return self.focus_next(),
-            // Jump history: F11 back, Shift+F11 forward (pairs with F12
-            // go-to-definition). Shift variant matched first. `Alt+-` / `Alt+=`
-            // are VTE-safe aliases for terminals that swallow F11 (e.g.
-            // gnome-terminal binds it to fullscreen); minus steps back, equals
-            // steps forward.
+            // Navigation, grouped on the F12 key: F12 go-to-definition,
+            // Shift+F12 jump back, Ctrl+F12 jump forward. F11 / Shift+F11 are
+            // kept as standard aliases for terminals that deliver them (many do;
+            // gnome-terminal captures F11 for fullscreen, which is why the
+            // F12-family chords exist). Modifier variants matched before plain.
             KeyCode::F(11) if shift => return self.jump_forward(),
             KeyCode::F(11) => return self.jump_back(),
-            KeyCode::Char('-') if alt => return self.jump_back(),
-            KeyCode::Char('=') if alt => return self.jump_forward(),
-            // Go to definition (VSCode-style); pairs with F11 back.
+            KeyCode::F(12) if shift => return self.jump_back(),
+            KeyCode::F(12) if ctrl => return self.jump_forward(),
             KeyCode::F(12) => return self.goto_definition(),
             // Autocomplete trigger: `Ctrl+N` (reliable) plus a best-effort
             // `Ctrl+Space` alias (reported as `Char(' ')`+Ctrl or `Null`).
@@ -2236,19 +2235,20 @@ mod tests {
     }
 
     #[test]
-    fn alt_minus_and_alt_equals_are_back_forward_aliases() {
-        // VTE-safe fallback for terminals that capture F11: Alt+- / Alt+=.
-        let (mut app, dir, alpha, bravo) = jump_fixture("alt_alias");
+    fn shift_f12_and_ctrl_f12_are_back_forward_aliases() {
+        // For terminals that capture F11 (e.g. gnome-terminal fullscreen), the
+        // jump chords are grouped on F12: Shift+F12 back, Ctrl+F12 forward.
+        let (mut app, dir, alpha, bravo) = jump_fixture("f12_alias");
         goto_line_commit(&mut app, "8");
         finder_open(&mut app, "bravo");
         assert_eq!(focused_path(&app), bravo);
 
-        // Alt+- steps back to alpha at the recorded deep line.
-        app.on_key(press(KeyCode::Char('-'), KeyModifiers::ALT));
+        // Shift+F12 steps back to alpha at the recorded deep line.
+        app.on_key(press(KeyCode::F(12), KeyModifiers::SHIFT));
         assert_eq!(focused_path(&app), alpha);
         assert_eq!(focused_line(&app), 7);
-        // Alt+= re-advances toward bravo.
-        app.on_key(press(KeyCode::Char('='), KeyModifiers::ALT));
+        // Ctrl+F12 re-advances toward bravo.
+        app.on_key(press(KeyCode::F(12), KeyModifiers::CONTROL));
         assert_eq!(focused_path(&app), bravo);
         std::fs::remove_dir_all(&dir).ok();
     }
