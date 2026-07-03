@@ -82,11 +82,7 @@ impl Syntax {
         }
     }
 
-    fn grammar(
-        language: tree_sitter::Language,
-        name: &str,
-        highlights_query: &str,
-    ) -> Syntax {
+    fn grammar(language: tree_sitter::Language, name: &str, highlights_query: &str) -> Syntax {
         let mut config = HighlightConfiguration::new(language, name, highlights_query, "", "")
             .expect("bundled highlight query is valid");
         config.configure(HIGHLIGHTS);
