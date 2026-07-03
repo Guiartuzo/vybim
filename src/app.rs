@@ -581,7 +581,14 @@ impl App {
             let focused = self.focus == Focus::Editor && i == self.focused;
             let buffer = &self.buffers[ed.buffer_id];
             let syntax = self.syntaxes[ed.buffer_id].as_ref();
-            ed.render(frame, region, buffer, syntax, focused, &theme);
+            // The app-level status (LSP progress etc.) rides on the focused
+            // pane's status bar rather than a dedicated global row.
+            let note = if i == self.focused {
+                self.lsp.status.as_deref()
+            } else {
+                None
+            };
+            ed.render(frame, region, buffer, syntax, focused, &theme, note);
         }
         // Thin vertical lines between panes.
         for i in 0..n.saturating_sub(1) {
@@ -2386,6 +2393,60 @@ mod tests {
             app.lsp.status.as_deref(),
             Some("2 definitions — showing first")
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // --- LSP progress -------------------------------------------------------
+
+    #[test]
+    fn progress_notifications_drive_the_lsp_status() {
+        let (mut app, dir, _alpha, _bravo) = jump_fixture("progress_status");
+        let (id, _sink) = app.lsp.install_test_server("rust", serde_json::json!({}));
+
+        let note = |value: serde_json::Value| crate::lsp::Message::Notification {
+            method: "$/progress".to_string(),
+            params: serde_json::json!({ "token": "rustAnalyzer/Indexing", "value": value }),
+        };
+        app.lsp.handle_message(
+            id,
+            note(serde_json::json!({ "kind": "begin", "title": "Indexing", "percentage": 0 })),
+        );
+        assert_eq!(app.lsp.status.as_deref(), Some("LSP: rust — Indexing 0%"));
+
+        app.lsp.handle_message(
+            id,
+            note(serde_json::json!({ "kind": "report", "message": "324/612", "percentage": 52 })),
+        );
+        assert_eq!(
+            app.lsp.status.as_deref(),
+            Some("LSP: rust — Indexing 324/612 52%")
+        );
+
+        app.lsp
+            .handle_message(id, note(serde_json::json!({ "kind": "end" })));
+        assert_eq!(app.lsp.status.as_deref(), Some("LSP: rust ready"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn work_done_progress_create_is_acked() {
+        let (mut app, dir, _alpha, _bravo) = jump_fixture("progress_ack");
+        let (id, sink) = app.lsp.install_test_server("rust", serde_json::json!({}));
+
+        let req_id = crate::lsp::protocol::RequestId::Num(7);
+        app.lsp.handle_message(
+            id,
+            crate::lsp::Message::Request {
+                id: req_id.clone(),
+                method: "window/workDoneProgress/create".to_string(),
+                params: serde_json::json!({ "token": "rustAnalyzer/Indexing" }),
+            },
+        );
+        let acks: Vec<_> = Lsp::sent_messages(&sink)
+            .into_iter()
+            .filter(|m| matches!(m, crate::lsp::Message::Response { id, .. } if *id == req_id))
+            .collect();
+        assert_eq!(acks.len(), 1);
         std::fs::remove_dir_all(&dir).ok();
     }
 

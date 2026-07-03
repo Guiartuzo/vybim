@@ -100,6 +100,16 @@ pub fn request_body(id: &RequestId, method: &str, params: Value) -> Value {
     })
 }
 
+/// Serialize an outgoing response body — for the rare server→client request
+/// we must ack (e.g. `window/workDoneProgress/create`).
+pub fn response_body(id: &RequestId, result: Value) -> Value {
+    serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "result": result,
+    })
+}
+
 /// Serialize an outgoing notification body (no id).
 pub fn notification_body(method: &str, params: Value) -> Value {
     serde_json::json!({

@@ -21,6 +21,16 @@ pub enum PendingKind {
     Definition,
 }
 
+/// One active `$/progress` job: the title from its `begin`, refreshed with the
+/// latest `report`'s message/percentage until `end` removes it.
+#[derive(Debug)]
+struct Progress {
+    token: String,
+    title: String,
+    message: Option<String>,
+    percentage: Option<u64>,
+}
+
 /// The protocol state for one language server.
 #[derive(Debug)]
 pub struct Server {
@@ -34,6 +44,9 @@ pub struct Server {
     pending: HashMap<RequestId, PendingKind>,
     /// Open documents by URI → last synced version.
     open_docs: HashMap<String, i32>,
+    /// Active `$/progress` jobs, most recently updated last (so the status
+    /// line shows what the server is doing *now*, e.g. indexing).
+    progress: Vec<Progress>,
 }
 
 impl Server {
@@ -44,6 +57,7 @@ impl Server {
             ids: IdSource::default(),
             pending: HashMap::new(),
             open_docs: HashMap::new(),
+            progress: Vec::new(),
         }
     }
 
@@ -58,7 +72,10 @@ impl Server {
                 "textDocument": {
                     "definition": { "linkSupport": true },
                     "synchronization": { "didSave": false }
-                }
+                },
+                // Opt in to `$/progress` so servers report long-running work
+                // (rust-analyzer's indexing, notably) instead of going silent.
+                "window": { "workDoneProgress": true }
             },
         });
         request_body(&id, "initialize", params)
@@ -106,6 +123,72 @@ impl Server {
     /// (e.g. the cursor moved before a definition reply arrived).
     pub fn supersede(&mut self, kind: PendingKind) {
         self.pending.retain(|_, k| *k != kind);
+    }
+
+    /// Digest a `$/progress` notification's params, updating the active-job
+    /// set. Returns whether anything changed (so the caller knows to refresh
+    /// the visible status).
+    pub fn on_progress(&mut self, params: &Value) -> bool {
+        // The token may be a string or a number; key on its display form.
+        let token = match params.get("token") {
+            Some(Value::String(s)) => s.clone(),
+            Some(other) => other.to_string(),
+            None => return false,
+        };
+        let Some(value) = params.get("value") else {
+            return false;
+        };
+        let text = |key: &str| value.get(key).and_then(Value::as_str).map(str::to_string);
+        let percentage = value.get("percentage").and_then(Value::as_u64);
+        match value.get("kind").and_then(Value::as_str) {
+            Some("begin") => {
+                self.progress.retain(|p| p.token != token);
+                self.progress.push(Progress {
+                    token,
+                    title: text("title").unwrap_or_else(|| "working".into()),
+                    message: text("message"),
+                    percentage,
+                });
+                true
+            }
+            Some("report") => {
+                // Refresh only what the report carries, keep the begin's title,
+                // and move the job to the back so it is the one displayed.
+                let Some(idx) = self.progress.iter().position(|p| p.token == token) else {
+                    return false;
+                };
+                let mut job = self.progress.remove(idx);
+                if let Some(message) = text("message") {
+                    job.message = Some(message);
+                }
+                if percentage.is_some() {
+                    job.percentage = percentage;
+                }
+                self.progress.push(job);
+                true
+            }
+            Some("end") => {
+                let before = self.progress.len();
+                self.progress.retain(|p| p.token != token);
+                self.progress.len() != before
+            }
+            _ => false,
+        }
+    }
+
+    /// The most recently updated active job as a one-line status
+    /// (`"Indexing 324/612 (regex) 52%"`), or `None` when the server is idle.
+    pub fn progress_line(&self) -> Option<String> {
+        let job = self.progress.last()?;
+        let mut line = job.title.clone();
+        if let Some(message) = &job.message {
+            line.push(' ');
+            line.push_str(message);
+        }
+        if let Some(pct) = job.percentage {
+            line.push_str(&format!(" {pct}%"));
+        }
+        Some(line)
     }
 
     /// `didOpen` for a freshly opened served document (version 1).
@@ -193,6 +276,79 @@ mod tests {
         let mut s = served();
         s.on_initialize_response(Some(&json!({ "capabilities": {} })));
         assert!(!s.supports_definition());
+    }
+
+    #[test]
+    fn initialize_advertises_work_done_progress() {
+        let mut s = served();
+        let body = s.initialize(Path::new("/tmp/proj"));
+        assert_eq!(
+            body["params"]["capabilities"]["window"]["workDoneProgress"],
+            json!(true)
+        );
+    }
+
+    #[test]
+    fn progress_lifecycle_begin_report_end() {
+        let mut s = served();
+        assert_eq!(s.progress_line(), None);
+
+        // begin: title (+ optional message/percentage) becomes the line.
+        assert!(s.on_progress(&json!({
+            "token": "rustAnalyzer/Indexing",
+            "value": { "kind": "begin", "title": "Indexing", "percentage": 0 }
+        })));
+        assert_eq!(s.progress_line().as_deref(), Some("Indexing 0%"));
+
+        // report: message/percentage refresh, the begin's title is kept.
+        assert!(s.on_progress(&json!({
+            "token": "rustAnalyzer/Indexing",
+            "value": { "kind": "report", "message": "324/612 (regex)", "percentage": 52 }
+        })));
+        assert_eq!(
+            s.progress_line().as_deref(),
+            Some("Indexing 324/612 (regex) 52%")
+        );
+
+        // end: the job disappears; idle again.
+        assert!(s.on_progress(&json!({
+            "token": "rustAnalyzer/Indexing",
+            "value": { "kind": "end" }
+        })));
+        assert_eq!(s.progress_line(), None);
+    }
+
+    #[test]
+    fn progress_shows_most_recently_updated_of_concurrent_jobs() {
+        let mut s = served();
+        let begin = |token: &str, title: &str| json!({ "token": token, "value": { "kind": "begin", "title": title } });
+        s.on_progress(&begin("t/fetch", "Fetching"));
+        s.on_progress(&begin("t/index", "Indexing"));
+        assert_eq!(s.progress_line().as_deref(), Some("Indexing"));
+
+        // A report on the older job brings it to the front of the display.
+        s.on_progress(&json!({
+            "token": "t/fetch",
+            "value": { "kind": "report", "message": "crates.io" }
+        }));
+        assert_eq!(s.progress_line().as_deref(), Some("Fetching crates.io"));
+
+        // Ending the displayed job falls back to the other active one.
+        s.on_progress(&json!({ "token": "t/fetch", "value": { "kind": "end" } }));
+        assert_eq!(s.progress_line().as_deref(), Some("Indexing"));
+    }
+
+    #[test]
+    fn malformed_progress_is_ignored() {
+        let mut s = served();
+        // No token / no value / unknown kind / report or end for an unknown
+        // token: all no-ops that report "nothing changed".
+        assert!(!s.on_progress(&json!({ "value": { "kind": "begin", "title": "X" } })));
+        assert!(!s.on_progress(&json!({ "token": "t" })));
+        assert!(!s.on_progress(&json!({ "token": "t", "value": { "kind": "???" } })));
+        assert!(!s.on_progress(&json!({ "token": "t", "value": { "kind": "report" } })));
+        assert!(!s.on_progress(&json!({ "token": "t", "value": { "kind": "end" } })));
+        assert_eq!(s.progress_line(), None);
     }
 
     #[test]

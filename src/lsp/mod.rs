@@ -222,7 +222,7 @@ impl Lsp {
     /// (store capabilities, send `initialized`, flush the queue); other
     /// responses are routed back to their feature via the returned [`Response`].
     pub fn handle_message(&mut self, server_id: usize, msg: Message) -> Option<Response> {
-        let (_language, running) = self.by_id_mut(server_id)?;
+        let (language, running) = self.by_id_mut(server_id)?;
         match msg {
             Message::Response { id, result, error } => {
                 let kind = running.server.on_response(&id)?;
@@ -241,9 +241,29 @@ impl Lsp {
                     }),
                 }
             }
-            // v1 stores/ignores server notifications and server-to-client
-            // requests (no diagnostics UI, no dynamic registration yet).
-            Message::Notification { .. } | Message::Request { .. } => None,
+            // `$/progress` drives the status line (rust-analyzer's indexing
+            // phase, notably); other notifications are ignored for now (no
+            // diagnostics UI yet).
+            Message::Notification { method, params } => {
+                if method == "$/progress" && running.server.on_progress(&params) {
+                    self.status = match running.server.progress_line() {
+                        Some(line) => Some(format!("LSP: {language} — {line}")),
+                        None => Some(format!("LSP: {language} ready")),
+                    };
+                }
+                None
+            }
+            // `window/workDoneProgress/create` just needs an empty ack before
+            // the server will stream `$/progress` for that token; other
+            // server-to-client requests are ignored (no dynamic registration).
+            Message::Request { id, method, .. } => {
+                if method == "window/workDoneProgress/create" {
+                    let _ = running
+                        .conn
+                        .send(&protocol::response_body(&id, Value::Null));
+                }
+                None
+            }
         }
     }
 

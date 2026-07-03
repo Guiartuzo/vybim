@@ -724,7 +724,8 @@ impl EditorPane {
 
     /// Render this pane into `area`: the buffer's visible region plus a
     /// one-row status bar. Only the focused pane places the hardware cursor.
-    /// `syntax` is `Some` when the buffer's language has a grammar.
+    /// `syntax` is `Some` when the buffer's language has a grammar. `note` is
+    /// an app-level status (LSP progress etc.) appended to the status bar.
     pub fn render(
         &mut self,
         frame: &mut Frame,
@@ -733,12 +734,13 @@ impl EditorPane {
         syntax: Option<&Syntax>,
         focused: bool,
         theme: &Theme,
+        note: Option<&str>,
     ) {
         let [content, status] =
             Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(area);
 
         self.render_content(frame, content, buffer, syntax, focused, theme);
-        self.render_status(frame, status, buffer, focused, theme);
+        self.render_status(frame, status, buffer, focused, theme, note);
     }
 
     fn render_content(
@@ -885,6 +887,7 @@ impl EditorPane {
         buffer: &Buffer,
         focused: bool,
         theme: &Theme,
+        note: Option<&str>,
     ) {
         let name = buffer
             .path()
@@ -892,8 +895,9 @@ impl EditorPane {
             .unwrap_or_else(|| "[No Name]".to_string());
         let dirty = if buffer.is_dirty() { " [+]" } else { "" };
         let selection = if self.has_selection() { "  SEL" } else { "" };
+        let note = note.map(|n| format!("    {n}")).unwrap_or_default();
         let text = format!(
-            " {name}{dirty}{selection}    Ln {}, Col {} ",
+            " {name}{dirty}{selection}    Ln {}, Col {}{note} ",
             self.cursor.line + 1,
             self.cursor.col + 1
         );
