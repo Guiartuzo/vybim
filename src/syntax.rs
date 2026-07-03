@@ -58,20 +58,27 @@ impl Syntax {
     /// grammar is bundled for it.
     pub fn for_path(path: &Path) -> Option<Syntax> {
         match path.extension()?.to_str()? {
-            "rs" => Some(Self::rust()),
+            "rs" => Some(Self::grammar(
+                tree_sitter_rust::LANGUAGE.into(),
+                "rust",
+                tree_sitter_rust::HIGHLIGHTS_QUERY,
+            )),
+            "c" | "h" => Some(Self::grammar(
+                tree_sitter_c::LANGUAGE.into(),
+                "c",
+                tree_sitter_c::HIGHLIGHT_QUERY,
+            )),
             _ => None,
         }
     }
 
-    fn rust() -> Syntax {
-        let mut config = HighlightConfiguration::new(
-            tree_sitter_rust::LANGUAGE.into(),
-            "rust",
-            tree_sitter_rust::HIGHLIGHTS_QUERY,
-            "",
-            "",
-        )
-        .expect("bundled Rust highlight query is valid");
+    fn grammar(
+        language: tree_sitter::Language,
+        name: &str,
+        highlights_query: &str,
+    ) -> Syntax {
+        let mut config = HighlightConfiguration::new(language, name, highlights_query, "", "")
+            .expect("bundled highlight query is valid");
         config.configure(HIGHLIGHTS);
 
         let styles = HIGHLIGHTS.iter().map(|name| style_for(name)).collect();
@@ -156,6 +163,24 @@ mod tests {
     #[test]
     fn rust_files_get_a_grammar() {
         assert!(Syntax::for_path(Path::new("main.rs")).is_some());
+    }
+
+    #[test]
+    fn c_files_and_headers_get_a_grammar() {
+        assert!(Syntax::for_path(Path::new("main.c")).is_some());
+        assert!(Syntax::for_path(Path::new("main.h")).is_some());
+    }
+
+    #[test]
+    fn c_keyword_is_highlighted() {
+        let syntax = Syntax::for_path(Path::new("x.c")).unwrap();
+        // "return" is a keyword; a span should cover it with the keyword color.
+        let spans = syntax.highlight_line("return 0;");
+        let keyword_style = style_for("keyword");
+        let covers_return = spans
+            .iter()
+            .any(|(s, e, style)| *s == 0 && *e == 6 && *style == keyword_style);
+        assert!(covers_return, "expected 'return' highlighted as a keyword");
     }
 
     #[test]
