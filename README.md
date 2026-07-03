@@ -8,9 +8,11 @@
 A minimalist, **modeless** terminal code editor — fast and snappy like `nano`/`vim`,
 but with a familiar VSCode-style editing model (arrow keys move, `Shift+Arrow`
 selects, `Ctrl+S` saves). It has a toggleable file-tree sidebar, split panes, line
-numbers, syntax highlighting, multiple cursors, word autocomplete, fuzzy file
-finding, an integrated terminal area (multiple terminals), and a side-by-side git
-diff view.
+numbers, syntax highlighting (Rust, C, C++, Python), multiple cursors, word
+autocomplete, fuzzy file finding, an integrated terminal area (multiple
+terminals), a side-by-side git diff view, and **LSP-powered go-to-definition**
+(`F12`) with cross-buffer jump history — language servers start automatically
+when you open a file they serve.
 
 ![Vybim demo](docs/demo.gif)
 
@@ -63,6 +65,7 @@ list in-app (it is generated from one table, so it can't drift from this README)
 | Key | Action |
 | --- | --- |
 | Arrows | Move the cursor |
+| `Ctrl+Left` / `Ctrl+Right` | Move by word |
 | `Home` / `End` | Move to the start / end of the line |
 | `PageUp` / `PageDown` | Move up / down by a viewport height |
 | `Shift`+(movement) | Extend a selection |
@@ -74,6 +77,9 @@ list in-app (it is generated from one table, so it can't drift from this README)
 | `Ctrl+F` | Find (incremental search; `Enter` next, `Esc` cancel) |
 | `Ctrl+G` | Go to line |
 | `Ctrl+P` | Fuzzy file finder |
+| `F12` | Go to definition (via LSP) |
+| `F11` (or `Shift+F12`) | Jump back (to where you pressed `F12`, across files) |
+| `Shift+F11` (or `Ctrl+F12`) | Jump forward |
 | `Ctrl+N` (or `Ctrl+Space`) | Autocomplete the current word |
 | `Ctrl+E` (or `Ctrl+\`) | Split the pane vertically |
 | `Ctrl+W` | Close the focused pane |
@@ -127,6 +133,37 @@ and do not reach the shell.
 | `r` | Refresh against `HEAD` |
 | `Esc` | Close the diff view |
 
+## Language intelligence (LSP)
+
+Opening a file whose language has a registered server starts that server
+automatically — no configuration needed if the server is on your `PATH`:
+
+| Language | Extensions | Default server |
+| --- | --- | --- |
+| Rust | `.rs` | `rust-analyzer` |
+| C | `.c` `.h` | `clangd` |
+| C++ | `.cpp` `.cc` `.cxx` `.hpp` | `clangd` |
+| Python | `.py` `.pyi` | `pyright-langserver` |
+| TypeScript / JavaScript | `.ts` `.tsx` `.js` `.jsx` | `typescript-language-server` |
+| Go | `.go` | `gopls` |
+
+The status bar keeps you informed: server startup, live indexing progress
+(`LSP: rust — Indexing 105/206 50%`), readiness, and two actionable hints —
+when a known server is **not installed**, and when clangd runs **without a
+`compile_commands.json`** (cross-file navigation degrades to header
+declarations without one; generate it with your build system — CMake's
+`-DCMAKE_EXPORT_COMPILE_COMMANDS=ON`, `bear -- make`, or the kernel's
+`gen_compile_commands.py`).
+
+Servers can be overridden (or added) in `~/.config/vybim/lsp.json`:
+
+```json
+{ "python": { "program": "pylsp", "args": [] } }
+```
+
+Current LSP scope: document sync + go-to-definition (`F12`). Diagnostics,
+hover, and LSP-driven completion are future changes.
+
 ## Architecture
 
 ```
@@ -140,6 +177,13 @@ file_find.rs     fuzzy file finder (subsequence ranking)
 minibuffer.rs    one-line prompt: search, go-to-line, fuzzy-find input
 complete.rs      buffer-word autocomplete popup
 syntax.rs        tree-sitter syntax highlighting (per visible line)
+jump.rs          cross-buffer jump history (back / forward)
+lsp/             language server client
+  mod.rs           server lifecycle, routing, status line
+  client.rs        per-server protocol state (pure, unit-testable)
+  protocol.rs      JSON-RPC shapes + char⇄UTF-16 position conversion
+  registry.rs      language → server command (defaults + user overrides)
+  transport.rs     subprocess stdio framing + reader thread
 git.rs           working-tree vs HEAD diff model
 diff_view.rs     side-by-side git diff surface
 terminal_area.rs docked terminal area: multiple terminals, tabs
@@ -158,6 +202,10 @@ indirection keeps shared state simple (no `Rc<RefCell<>>`).
   spaces for `Tab`).
 - Incremental search exists (`Ctrl+F`), but there is no search-and-replace UI.
 - Splits are vertical only; no editor tabs or horizontal splits.
+- LSP covers go-to-definition only for now — no diagnostics UI, hover, or
+  LSP-driven completion yet (autocomplete is buffer-word based).
+- Grammars are bundled per language (Rust, C, C++, Python); other languages
+  render unhighlighted even when their language server runs.
 
 ## Development
 
