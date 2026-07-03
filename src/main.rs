@@ -20,8 +20,11 @@ use buffer::Buffer;
 
 fn main() -> std::io::Result<()> {
     // Open the file given on the command line, or start with an empty buffer.
+    // Canonicalize so the buffer's path — and thus its LSP `file://` URI — is
+    // absolute; a relative URI makes servers reject every request on the
+    // document with "url is not a file".
     let buffer = match std::env::args().nth(1) {
-        Some(path) => Buffer::from_path(path)?,
+        Some(path) => Buffer::from_path(std::fs::canonicalize(path)?)?,
         None => Buffer::empty(),
     };
     let root = std::env::current_dir()?;
