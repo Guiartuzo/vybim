@@ -164,6 +164,28 @@ Servers can be overridden (or added) in `~/.config/vybim/lsp.json`:
 Current LSP scope: document sync + go-to-definition (`F12`). Diagnostics,
 hover, and LSP-driven completion are future changes.
 
+## Security
+
+Vybim is designed to be safe for code that must stay on your machine:
+
+- **No network, no telemetry.** Vybim has zero network-capable dependencies;
+  your code is only ever shared with the language servers it spawns locally
+  (over pipes), and the bundled defaults are all offline tools.
+- **Private logs.** Language-server stderr is logged to
+  `~/.local/state/vybim/lsp` (`$XDG_STATE_HOME`), created `0700` — never to a
+  shared temp directory.
+- **Atomic saves.** `Ctrl+S` writes a temp file and renames it over the
+  target, so a crash mid-save cannot truncate your file.
+- **Symlinks are not followed** by the file tree or fuzzy finder, and
+  scanning is capped.
+
+One caveat, inherent to the LSP ecosystem rather than Vybim: **opening a
+repository starts its language server, and some servers execute code from
+the repository** — rust-analyzer builds and runs `build.rs` and proc macros;
+clangd consumes the repo's `compile_commands.json` and `.clangd`. Treat
+opening a repo like building it: only open code you trust. (A first-open
+trust prompt is a candidate future change.)
+
 ## Architecture
 
 ```
