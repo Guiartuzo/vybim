@@ -69,8 +69,15 @@ pub struct Lsp {
 
 impl Lsp {
     pub fn new() -> Self {
-        let log_dir = std::env::temp_dir().join("vybim-lsp");
+        let log_dir = log_dir();
         let _ = std::fs::create_dir_all(&log_dir);
+        // Server logs carry project paths (and whatever a server prints), so
+        // keep the directory private to the user.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&log_dir, std::fs::Permissions::from_mode(0o700));
+        }
         Self {
             registry: Registry::load(),
             servers: HashMap::new(),
@@ -315,6 +322,18 @@ impl Default for Lsp {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Where server stderr logs go: a per-user state directory
+/// (`$XDG_STATE_HOME/vybim/lsp`, defaulting to `~/.local/state/vybim/lsp`) —
+/// never the shared system temp dir, where a fixed path in a world-writable
+/// directory invites both squatting and reading by other local users.
+fn log_dir() -> PathBuf {
+    std::env::var_os("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::home_dir().map(|h| h.join(".local/state")))
+        .unwrap_or_else(std::env::temp_dir)
+        .join("vybim/lsp")
 }
 
 /// Languages whose server (clangd) needs a compilation database for
