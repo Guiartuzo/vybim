@@ -110,6 +110,11 @@ const BINDINGS: &[KeyBinding] = &[
     },
     KeyBinding {
         group: "Editor",
+        keys: "Ctrl+Left / Ctrl+Right",
+        action: "Move by word",
+    },
+    KeyBinding {
+        group: "Editor",
         keys: "Shift+move",
         action: "Extend selection",
     },
