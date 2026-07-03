@@ -87,6 +87,14 @@ impl Lsp {
             return true;
         }
         let Some(cmd) = self.registry.resolve(language) else {
+            // A language we *would* serve but whose binary is missing gets a
+            // status-line hint; a truly unmapped language stays a silent no-op.
+            if let Some(cmd) = self.registry.mapped(language) {
+                self.status = Some(format!(
+                    "LSP: {} not found on PATH — no {language} features",
+                    cmd.program
+                ));
+            }
             return false;
         };
         let id = self.next_id;

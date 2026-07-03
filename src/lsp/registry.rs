@@ -78,18 +78,26 @@ impl Registry {
 
     /// Resolve the command to serve `language`: a user override beats the
     /// default. `None` when the language is unmapped, or the resolved program
-    /// is not found on `PATH` (so a missing server is a silent no-op).
+    /// is not found on `PATH` (callers can distinguish the two via [`mapped`]
+    /// to tell the user about a missing binary).
+    ///
+    /// [`mapped`]: Registry::mapped
     pub fn resolve(&self, language: &str) -> Option<ServerCmd> {
-        let cmd = self
-            .overrides
-            .get(language)
-            .cloned()
-            .or_else(|| default_command(language))?;
+        let cmd = self.mapped(language)?;
         if program_on_path(&cmd.program) {
             Some(cmd)
         } else {
             None
         }
+    }
+
+    /// The command mapped for `language` regardless of whether its program is
+    /// actually installed.
+    pub fn mapped(&self, language: &str) -> Option<ServerCmd> {
+        self.overrides
+            .get(language)
+            .cloned()
+            .or_else(|| default_command(language))
     }
 
     #[cfg(test)]
@@ -164,5 +172,15 @@ mod tests {
             ServerCmd::new("definitely-not-a-real-program-xyz", &[]),
         );
         assert_eq!(reg.resolve("toy"), None);
+    }
+
+    #[test]
+    fn mapped_reports_the_command_even_when_not_installed() {
+        // `mapped` ignores PATH, so a caller can tell "no server for this
+        // language" apart from "server known but not installed".
+        let cmd = ServerCmd::new("definitely-not-a-real-program-xyz", &[]);
+        let reg = Registry::default().with_override("toy", cmd.clone());
+        assert_eq!(reg.mapped("toy"), Some(cmd));
+        assert_eq!(reg.mapped("cobol"), None);
     }
 }
