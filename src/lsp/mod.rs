@@ -129,8 +129,17 @@ impl Lsp {
         let Some(language) = language_of(path) else {
             return;
         };
+        let fresh_start = !self.servers.contains_key(language);
         if !self.ensure_started(language, root, tx) {
             return;
+        }
+        // On the first start of a database-driven server (clangd), warn when
+        // no compilation database is discoverable: the server still runs, but
+        // cross-file navigation silently degrades to header declarations.
+        if fresh_start && needs_compile_db(language) && !compile_db_near(path) {
+            self.status = Some(format!(
+                "LSP: {language} — no compile_commands.json (cross-file navigation limited)"
+            ));
         }
         let uri = file_uri(path);
         let running = self.servers.get_mut(language).expect("just ensured");
@@ -305,5 +314,63 @@ impl Lsp {
 impl Default for Lsp {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Languages whose server (clangd) needs a compilation database for
+/// cross-file navigation; used to hint when none is discoverable.
+fn needs_compile_db(language: &str) -> bool {
+    matches!(language, "c" | "cpp")
+}
+
+/// Whether a `compile_commands.json` exists in any ancestor directory of
+/// `path`, or in an ancestor's `build/` — the same places clangd searches.
+fn compile_db_near(path: &Path) -> bool {
+    path.ancestors().skip(1).any(|dir| {
+        dir.join("compile_commands.json").exists()
+            || dir.join("build/compile_commands.json").exists()
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A unique temp dir for one test, removed by the caller.
+    fn temp_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("vybim-lsp-test-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn compile_db_found_in_ancestor_or_its_build_dir() {
+        let dir = temp_dir("db-search");
+        let src = dir.join("proj/src");
+        std::fs::create_dir_all(&src).unwrap();
+        let file = src.join("main.c");
+
+        // Nothing anywhere: not found.
+        assert!(!compile_db_near(&file));
+
+        // In an ancestor (the project root): found.
+        std::fs::write(dir.join("proj/compile_commands.json"), "[]").unwrap();
+        assert!(compile_db_near(&file));
+
+        // Only in an ancestor's build/: also found.
+        std::fs::remove_file(dir.join("proj/compile_commands.json")).unwrap();
+        std::fs::create_dir_all(dir.join("proj/build")).unwrap();
+        std::fs::write(dir.join("proj/build/compile_commands.json"), "[]").unwrap();
+        assert!(compile_db_near(&file));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn only_clangd_languages_need_a_compile_db() {
+        assert!(needs_compile_db("c"));
+        assert!(needs_compile_db("cpp"));
+        assert!(!needs_compile_db("rust"));
+        assert!(!needs_compile_db("python"));
     }
 }
