@@ -588,7 +588,14 @@ impl App {
             } else {
                 None
             };
-            ed.render(frame, region, buffer, syntax, focused, &theme, note);
+            let ctx = crate::pane::RenderCtx {
+                buffer,
+                syntax,
+                focused,
+                theme: &theme,
+                note,
+            };
+            ed.render(frame, region, &ctx);
         }
         // Thin vertical lines between panes.
         for i in 0..n.saturating_sub(1) {

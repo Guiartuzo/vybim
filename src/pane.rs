@@ -724,34 +724,22 @@ impl EditorPane {
 
     /// Render this pane into `area`: the buffer's visible region plus a
     /// one-row status bar. Only the focused pane places the hardware cursor.
-    /// `syntax` is `Some` when the buffer's language has a grammar. `note` is
-    /// an app-level status (LSP progress etc.) appended to the status bar.
-    pub fn render(
-        &mut self,
-        frame: &mut Frame,
-        area: Rect,
-        buffer: &Buffer,
-        syntax: Option<&Syntax>,
-        focused: bool,
-        theme: &Theme,
-        note: Option<&str>,
-    ) {
+    pub fn render(&mut self, frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
         let [content, status] =
             Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(area);
 
-        self.render_content(frame, content, buffer, syntax, focused, theme);
-        self.render_status(frame, status, buffer, focused, theme, note);
+        self.render_content(frame, content, ctx);
+        self.render_status(frame, status, ctx);
     }
 
-    fn render_content(
-        &mut self,
-        frame: &mut Frame,
-        area: Rect,
-        buffer: &Buffer,
-        syntax: Option<&Syntax>,
-        focused: bool,
-        theme: &Theme,
-    ) {
+    fn render_content(&mut self, frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
+        let &RenderCtx {
+            buffer,
+            syntax,
+            focused,
+            theme,
+            ..
+        } = ctx;
         // Reserve a left gutter for line numbers; text fills the rest.
         let num_w = gutter_num_width(buffer.line_count());
         let gutter_w = (num_w + 1) as u16;
@@ -880,15 +868,14 @@ impl EditorPane {
         }
     }
 
-    fn render_status(
-        &self,
-        frame: &mut Frame,
-        area: Rect,
-        buffer: &Buffer,
-        focused: bool,
-        theme: &Theme,
-        note: Option<&str>,
-    ) {
+    fn render_status(&self, frame: &mut Frame, area: Rect, ctx: &RenderCtx) {
+        let &RenderCtx {
+            buffer,
+            focused,
+            theme,
+            note,
+            ..
+        } = ctx;
         let name = buffer
             .path()
             .map(|p| p.display().to_string())
@@ -905,6 +892,18 @@ impl EditorPane {
         let style = theme.list_row(focused);
         frame.render_widget(Paragraph::new(text).style(style), area);
     }
+}
+
+/// Per-frame inputs a pane needs from the app to draw itself. `syntax` is
+/// `Some` when the buffer's language has a grammar; `note` is an app-level
+/// status (LSP progress etc.) appended to the status bar.
+#[derive(Clone, Copy)]
+pub struct RenderCtx<'a> {
+    pub buffer: &'a Buffer,
+    pub syntax: Option<&'a Syntax>,
+    pub focused: bool,
+    pub theme: &'a Theme,
+    pub note: Option<&'a str>,
 }
 
 /// Build a styled line from `text`, applying syntax highlight spans (byte
