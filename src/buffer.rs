@@ -261,8 +261,34 @@ impl Buffer {
         let Some(path) = self.path.clone() else {
             return Ok(false);
         };
-        let file = fs::File::create(&path)?;
-        self.rope.write_to(io::BufWriter::new(file))?;
+        // Atomic save: write a sibling temp file, fsync, then rename over the
+        // target — a crash mid-write can never leave a truncated file. The
+        // temp lives in the same directory so the rename stays one-filesystem.
+        let mut tmp = path.clone();
+        let name = tmp
+            .file_name()
+            .map(|n| n.to_os_string())
+            .unwrap_or_default();
+        tmp.set_file_name(format!(
+            ".{}.vybim-{}.tmp",
+            name.display(),
+            std::process::id()
+        ));
+        let written = (|| {
+            let mut w = io::BufWriter::new(fs::File::create(&tmp)?);
+            self.rope.write_to(&mut w)?;
+            let file = w.into_inner().map_err(io::Error::from)?;
+            file.sync_all()?;
+            // Keep the target's permissions rather than the temp's defaults.
+            if let Ok(meta) = fs::metadata(&path) {
+                let _ = fs::set_permissions(&tmp, meta.permissions());
+            }
+            fs::rename(&tmp, &path)
+        })();
+        if written.is_err() {
+            let _ = fs::remove_file(&tmp);
+        }
+        written?;
         self.dirty = false;
         Ok(true)
     }
@@ -359,6 +385,28 @@ mod tests {
             .unwrap();
         assert_eq!(written, "old!");
         std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn save_is_atomic_and_leaves_no_temp_file() {
+        let dir = std::env::temp_dir().join(format!("vybim_atomic_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("a.txt");
+        std::fs::write(&path, "old").unwrap();
+
+        let mut b = Buffer::from_path(&path).unwrap();
+        b.insert(0, "new ");
+        assert!(b.save().unwrap());
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "new old");
+        // The sibling temp file was renamed away, not left behind.
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "stray temp files: {leftovers:?}");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
