@@ -68,6 +68,16 @@ impl Syntax {
                 "c",
                 tree_sitter_c::HIGHLIGHT_QUERY,
             )),
+            "py" | "pyi" => Some(Self::grammar(
+                tree_sitter_python::LANGUAGE.into(),
+                "python",
+                tree_sitter_python::HIGHLIGHTS_QUERY,
+            )),
+            "cpp" | "cc" | "cxx" | "hpp" => Some(Self::grammar(
+                tree_sitter_cpp::LANGUAGE.into(),
+                "cpp",
+                tree_sitter_cpp::HIGHLIGHT_QUERY,
+            )),
             _ => None,
         }
     }
@@ -169,6 +179,38 @@ mod tests {
     fn c_files_and_headers_get_a_grammar() {
         assert!(Syntax::for_path(Path::new("main.c")).is_some());
         assert!(Syntax::for_path(Path::new("main.h")).is_some());
+    }
+
+    #[test]
+    fn python_and_cpp_files_get_a_grammar() {
+        assert!(Syntax::for_path(Path::new("app.py")).is_some());
+        assert!(Syntax::for_path(Path::new("app.pyi")).is_some());
+        assert!(Syntax::for_path(Path::new("app.cpp")).is_some());
+        assert!(Syntax::for_path(Path::new("app.cc")).is_some());
+        assert!(Syntax::for_path(Path::new("app.hpp")).is_some());
+    }
+
+    #[test]
+    fn python_and_cpp_keywords_are_highlighted() {
+        let keyword_style = style_for("keyword");
+        // Python: "def" (bytes 0..3) is a keyword.
+        let py = Syntax::for_path(Path::new("x.py")).unwrap();
+        let spans = py.highlight_line("def f():");
+        assert!(
+            spans
+                .iter()
+                .any(|(s, e, style)| *s == 0 && *e == 3 && *style == keyword_style),
+            "expected 'def' highlighted as a keyword"
+        );
+        // C++: "class" (bytes 0..5) is a keyword.
+        let cpp = Syntax::for_path(Path::new("x.cpp")).unwrap();
+        let spans = cpp.highlight_line("class Foo {};");
+        assert!(
+            spans
+                .iter()
+                .any(|(s, e, style)| *s == 0 && *e == 5 && *style == keyword_style),
+            "expected 'class' highlighted as a keyword"
+        );
     }
 
     #[test]
