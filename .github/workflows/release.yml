@@ -25,33 +25,72 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # Linux links against a glibc 2.31 baseline (Ubuntu 20.04+) via
+          # cargo-zigbuild, so the explicit target and its output dir differ.
           - os: ubuntu-latest
             target_label: linux-x86_64
             bin: vybim
+            targets: x86_64-unknown-linux-gnu
+            bin_dir: target/x86_64-unknown-linux-gnu/release
           - os: macos-latest
             target_label: macos-arm64
             bin: vybim
+            bin_dir: target/release
           - os: windows-latest
             target_label: windows-x86_64
             bin: vybim.exe
+            bin_dir: target/release
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.targets }}
       # tree-sitter-rust builds a C grammar — Linux needs gcc; Windows (MSVC)
       # and macOS (clang) runners already ship a C toolchain.
       - name: Install C toolchain (Linux)
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y gcc
 
+      # Zig's bundled clang links the binary against glibc 2.31 stubs and
+      # compiles the tree-sitter C grammars against the matching headers, so
+      # the asset runs on Ubuntu 20.04+ regardless of the runner's glibc.
+      # Zig is pre-1.0: pin the exact version and bump it deliberately.
+      - name: Install Zig (Linux)
+        if: runner.os == 'Linux'
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.14.1
+      - name: Install cargo-zigbuild (Linux)
+        if: runner.os == 'Linux'
+        run: cargo install --locked cargo-zigbuild
+
+      - name: Build release binary (Linux, glibc 2.31 baseline)
+        if: runner.os == 'Linux'
+        run: cargo zigbuild --release --verbose --target x86_64-unknown-linux-gnu.2.31
+
       - name: Build release binary
+        if: runner.os != 'Linux'
         run: cargo build --release --verbose
+
+      # The 2.31 floor must not regress silently: fail the release if the
+      # binary picked up any glibc symbol newer than Ubuntu 20.04 provides.
+      - name: Enforce glibc 2.31 baseline (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          max=$(objdump -T "${{ matrix.bin_dir }}/${{ matrix.bin }}" \
+            | grep -oE 'GLIBC_[0-9]+(\.[0-9]+)*' | sort -Vu | tail -n1)
+          echo "Max required glibc symbol version: ${max:-none}"
+          if [ -n "$max" ] && [ "$(printf '%s\n' "$max" GLIBC_2.31 | sort -V | tail -n1)" != "GLIBC_2.31" ]; then
+            echo "::error::Binary requires $max, exceeding the GLIBC_2.31 (Ubuntu 20.04) baseline"
+            exit 1
+          fi
 
       - name: Package (tar.gz)
         if: runner.os != 'Windows'
         shell: bash
         run: |
           name="vybim-${GITHUB_REF_NAME}-${{ matrix.target_label }}"
-          tar -czf "${name}.tar.gz" -C target/release "${{ matrix.bin }}"
+          tar -czf "${name}.tar.gz" -C "${{ matrix.bin_dir }}" "${{ matrix.bin }}"
           echo "ASSET=${name}.tar.gz" >> "$GITHUB_ENV"
 
       - name: Package (zip)
@@ -59,7 +98,7 @@ jobs:
         shell: bash
         run: |
           name="vybim-${GITHUB_REF_NAME}-${{ matrix.target_label }}"
-          7z a "${name}.zip" "./target/release/${{ matrix.bin }}"
+          7z a "${name}.zip" "./${{ matrix.bin_dir }}/${{ matrix.bin }}"
           echo "ASSET=${name}.zip" >> "$GITHUB_ENV"
 
       - name: Upload to GitHub Release

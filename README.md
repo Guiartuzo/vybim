@@ -26,6 +26,9 @@ Prebuilt binaries for **Linux, macOS, and Windows** are published on the
 [**Releases page**](https://github.com/Guiartuzo/vybim/releases) — download the
 archive for your OS, extract, and run `vybim`. No toolchain required.
 
+The Linux binary requires **glibc ≥ 2.31 (Ubuntu 20.04 or newer)**; on older or
+non-glibc distributions, build from source instead.
+
 ### Build from source
 
 Vybim is written in Rust. With a Rust toolchain installed (`rustup`):
