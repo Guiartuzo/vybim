@@ -1,0 +1,33 @@
+# One-shot: set curated notes on the v0.3.0 GitHub Release, whose body was
+# published as three copies of the auto-generated compare link (fixed in
+# release.yml in this same commit). Runs once, on the push that adds this
+# file, and is deleted right after.
+name: Backfill v0.3.0 release notes
+
+on:
+  push:
+    branches: [main]
+    paths: [".github/workflows/backfill-v0.3.0-notes.yml"]
+
+permissions:
+  contents: write
+
+jobs:
+  backfill:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set the release body
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cat > notes.md <<'EOF'
+          The multi-file milestone: working across a repository is now solid.
+
+          - The fuzzy finder and the file tree are both gitignore-aware and agree on what the workspace contains.
+          - A file opens into exactly one buffer no matter the route to it (tree, finder, or jump), so unsaved edits survive cross-file navigation.
+          - Throttled LSP document syncs are flushed instead of going stale after a burst of typing.
+          - Go-to-definition lands on the symbol's name rather than its doc comment.
+
+          **Full Changelog**: https://github.com/Guiartuzo/vybim/compare/v0.2.1...v0.3.0
+          EOF
+          gh release edit v0.3.0 --repo "$GITHUB_REPOSITORY" --notes-file notes.md

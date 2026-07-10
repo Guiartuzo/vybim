@@ -2,8 +2,9 @@
 # Build per-OS binaries and publish them as assets on a GitHub Release, so
 # users can download a binary instead of building from source.
 #
-# Cut a release by pushing a version tag:
-#   git tag v0.1.0 && git push origin v0.1.0
+# Cut a release by pushing an annotated version tag whose message is the
+# release notes — it becomes the GitHub Release body:
+#   git tag -a v0.1.0 -m "notes..." && git push origin v0.1.0
 name: Release
 
 on:
@@ -101,8 +102,28 @@ jobs:
           7z a "${name}.zip" "./${{ matrix.bin_dir }}/${{ matrix.bin }}"
           echo "ASSET=${name}.zip" >> "$GITHUB_ENV"
 
-      - name: Upload to GitHub Release
+      # The release body comes from the tag's annotation — the curated notes
+      # written when the tag was cut. (`%(contents)` of a lightweight tag
+      # falls back to the tagged commit's message.) actions/checkout leaves
+      # the tag peeled to its commit, so re-fetch the real tag object first.
+      # Only this job writes the body: when all three matrix jobs passed one,
+      # each appended its own copy (v0.3.0 shipped with the auto-generated
+      # notes tripled).
+      - name: Extract release notes from the tag annotation (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          git fetch --force origin "refs/tags/${GITHUB_REF_NAME}:refs/tags/${GITHUB_REF_NAME}"
+          git tag -l --format='%(contents)' "${GITHUB_REF_NAME}" > RELEASE_NOTES.md
+
+      - name: Upload to GitHub Release (and set the notes)
+        if: runner.os == 'Linux'
         uses: softprops/action-gh-release@v2
         with:
           files: ${{ env.ASSET }}
-          generate_release_notes: true
+          body_path: RELEASE_NOTES.md
+
+      - name: Upload to GitHub Release
+        if: runner.os != 'Linux'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ env.ASSET }}
