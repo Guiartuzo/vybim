@@ -889,6 +889,18 @@ impl App {
 
     /// Open `path` into the focused pane (as a new buffer) and focus the editor.
     fn open_in_focused_pane(&mut self, path: PathBuf) {
+        // Canonicalize so every route to a file (tree, finder, CLI, LSP jump)
+        // agrees on its identity, then reuse an already-open buffer: one file,
+        // one buffer — a second copy would shadow unsaved edits in the first
+        // and fight over the same LSP document.
+        let Ok(path) = std::fs::canonicalize(&path) else {
+            return;
+        };
+        if let Some(id) = self.buffer_id_of(&path) {
+            self.panes[self.focused].set_buffer(id);
+            self.focus = Focus::Editor;
+            return;
+        }
         if let Ok(buffer) = Buffer::from_path(&path) {
             let syntax = buffer.path().and_then(Syntax::for_path);
             let id = self.buffers.len();
@@ -898,6 +910,11 @@ impl App {
             self.focus = Focus::Editor;
             self.lsp_did_open(&path);
         }
+    }
+
+    /// The id of the already-open buffer holding `path` (canonical), if any.
+    fn buffer_id_of(&self, path: &Path) -> Option<usize> {
+        self.buffers.iter().position(|b| b.path() == Some(path))
     }
 
     // --- language server hooks ---------------------------------------------
@@ -2393,6 +2410,34 @@ mod tests {
         assert_eq!(reqs.len(), 1);
         assert_eq!(reqs[0]["position"]["line"], 3);
         assert_eq!(reqs[0]["position"]["character"], 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn reopening_a_file_reuses_its_buffer() {
+        let (mut app, dir, _alpha, bravo) = jump_fixture("reuse_open");
+        app.open_in_focused_pane(bravo.clone());
+        let opened = app.buffers.len();
+        let id = app.panes[app.focused].buffer_id;
+        app.open_in_focused_pane(bravo);
+        assert_eq!(app.buffers.len(), opened); // no duplicate buffer
+        assert_eq!(app.panes[app.focused].buffer_id, id);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn jumping_back_reuses_the_edited_buffer_not_a_disk_copy() {
+        let (mut app, dir, alpha, bravo) = jump_fixture("reuse_back");
+        // Dirty alpha, jump away via the finder (records an origin), come back.
+        app.on_key(press(KeyCode::Char('x'), KeyModifiers::NONE));
+        finder_open(&mut app, "bravo");
+        assert_eq!(focused_path(&app), bravo);
+        app.on_key(press(KeyCode::F(11), KeyModifiers::NONE));
+        assert_eq!(focused_path(&app), alpha);
+        // The unsaved edit is still visible: same buffer, not a fresh disk copy.
+        assert_eq!(app.buffers.len(), 2);
+        let text = app.buffers[app.panes[app.focused].buffer_id].text();
+        assert!(text.starts_with('x'));
         std::fs::remove_dir_all(&dir).ok();
     }
 
