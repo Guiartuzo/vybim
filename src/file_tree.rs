@@ -11,12 +11,12 @@
 
 use std::path::{Path, PathBuf};
 
+use ignore::WalkBuilder;
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::Style;
 use ratatui::text::{Line, Text};
 use ratatui::widgets::{Borders, Paragraph};
-use ignore::WalkBuilder;
 
 use crate::theme::Theme;
 
