@@ -1849,7 +1849,6 @@ dependencies = [
  "tree-sitter-python",
  "tree-sitter-rust",
  "vt100",
- "walkdir",
 ]
 
 [[package]]

@@ -4,6 +4,10 @@
 //! Each directory's children are read only when it is first expanded, so
 //! opening Vybim in a large repository stays instant. The tree is rendered by
 //! flattening the expanded nodes into a list of visible rows.
+//!
+//! Like the fuzzy finder, the walk is gitignore-aware and skips hidden
+//! (dot-prefixed) entries — the tree and the finder agree on what the
+//! workspace contains.
 
 use std::path::{Path, PathBuf};
 
@@ -12,7 +16,7 @@ use ratatui::layout::Rect;
 use ratatui::style::Style;
 use ratatui::text::{Line, Text};
 use ratatui::widgets::{Borders, Paragraph};
-use walkdir::WalkDir;
+use ignore::WalkBuilder;
 
 use crate::theme::Theme;
 
@@ -46,14 +50,19 @@ impl Node {
 }
 
 /// Read a directory's immediate children, directories first then files, each
-/// group sorted by name.
+/// group sorted by name. Hidden and gitignored entries are skipped, matching
+/// the fuzzy finder's walk.
 fn read_children(dir: &Path, depth: usize) -> Vec<Node> {
-    let mut nodes: Vec<Node> = WalkDir::new(dir)
-        .min_depth(1)
-        .max_depth(1)
-        .into_iter()
-        .filter_map(Result::ok)
-        .map(|e| Node::new(e.path().to_path_buf(), e.file_type().is_dir(), depth))
+    let mut nodes: Vec<Node> = WalkBuilder::new(dir)
+        .max_depth(Some(1))
+        .build()
+        .flatten()
+        // The walk yields `dir` itself at depth 0; only its children matter.
+        .filter(|e| e.depth() == 1)
+        .map(|e| {
+            let is_dir = e.file_type().is_some_and(|t| t.is_dir());
+            Node::new(e.path().to_path_buf(), is_dir, depth)
+        })
         .collect();
     nodes.sort_by(|a, b| b.is_dir.cmp(&a.is_dir).then_with(|| a.name.cmp(&b.name)));
     nodes
@@ -277,6 +286,20 @@ mod tests {
     #[test]
     fn lists_dirs_first_then_files() {
         let root = fixture();
+        let tree = FileTree::new(&root);
+        assert_eq!(names(&tree), vec!["sub", "a.txt", "z.txt"]);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn hidden_and_explicitly_ignored_entries_are_skipped() {
+        let root = fixture();
+        // `.hidden` is skipped by the hidden filter; `scratch.txt` by the
+        // `.ignore` file (which, unlike `.gitignore`, applies outside a git
+        // repository too) — the same walk rules as the fuzzy finder.
+        std::fs::write(root.join(".hidden"), "x").unwrap();
+        std::fs::write(root.join(".ignore"), "scratch.txt\n").unwrap();
+        std::fs::write(root.join("scratch.txt"), "x").unwrap();
         let tree = FileTree::new(&root);
         assert_eq!(names(&tree), vec!["sub", "a.txt", "z.txt"]);
         std::fs::remove_dir_all(&root).ok();
