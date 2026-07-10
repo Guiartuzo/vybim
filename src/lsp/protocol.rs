@@ -158,7 +158,9 @@ pub fn uri_to_path(uri: &str) -> Option<PathBuf> {
 /// Parse a `textDocument/definition` result — which may be a single
 /// `Location`, an array of them, or `LocationLink[]` — into the primary
 /// target `(uri, start position)` and the total count. `None` for a
-/// null/empty result.
+/// null/empty result. For links the position is the *selection* range —
+/// the symbol's name — not the full item range, which starts at any
+/// preceding doc comment or attributes.
 pub fn primary_definition(result: &Value) -> Option<(String, Position, usize)> {
     use lsp_types::GotoDefinitionResponse as R;
     let resp: R = serde_json::from_value(result.clone()).ok()?;
@@ -172,7 +174,7 @@ pub fn primary_definition(result: &Value) -> Option<(String, Position, usize)> {
             let first = links.first()?;
             (
                 first.target_uri.to_string(),
-                first.target_range.start,
+                first.target_selection_range.start,
                 links.len(),
             )
         }
@@ -221,6 +223,27 @@ mod tests {
         assert_eq!(ids.next(), RequestId::Num(1));
         assert_eq!(ids.next(), RequestId::Num(2));
         assert_eq!(ids.next(), RequestId::Num(3));
+    }
+
+    #[test]
+    fn location_links_target_the_selection_range_not_the_full_item() {
+        // The full range starts at the item's doc comment; the selection
+        // range is the symbol's name. Navigation wants the name.
+        let result = serde_json::json!([{
+            "targetUri": "file:///tmp/x.rs",
+            "targetRange": {
+                "start": { "line": 380, "character": 0 },
+                "end": { "line": 400, "character": 1 }
+            },
+            "targetSelectionRange": {
+                "start": { "line": 384, "character": 11 },
+                "end": { "line": 384, "character": 14 }
+            }
+        }]);
+        let (uri, pos, count) = primary_definition(&result).unwrap();
+        assert_eq!(uri, "file:///tmp/x.rs");
+        assert_eq!((pos.line, pos.character), (384, 11));
+        assert_eq!(count, 1);
     }
 
     #[test]
