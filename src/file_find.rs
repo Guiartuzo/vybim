@@ -9,10 +9,10 @@
 
 use std::path::{Path, PathBuf};
 
-use walkdir::{DirEntry, WalkDir};
+use ignore::WalkBuilder;
 
 /// Upper bound on files gathered into a snapshot, so the finder stays bounded on
-/// huge trees. Beyond this the walk simply stops.
+/// huge trees. When the walk is cut short, [`FileSnapshot::truncated`] says so.
 pub const MAX_FILES: usize = 10_000;
 
 /// A score bonus for a query char that lands on a word/path boundary (start of
@@ -37,41 +37,48 @@ pub struct FileItem {
     pub display: String,
 }
 
-/// Recursively walk `root`, collecting regular files (skipping `.git` and any
-/// other dot-prefixed / hidden directory or file), with the root-relative path
-/// as the display string. Bounded to [`MAX_FILES`].
-pub fn gather_files(root: impl AsRef<Path>) -> Vec<FileItem> {
+/// A workspace snapshot: the gathered files, plus whether the walk was cut
+/// short by the file cap while eligible files remained unvisited.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileSnapshot {
+    pub items: Vec<FileItem>,
+    pub truncated: bool,
+}
+
+/// Recursively walk `root`, collecting regular files with the root-relative
+/// path as the display string. The walk follows ripgrep's defaults: hidden
+/// (dot-prefixed) files and directories are skipped (which covers `.git`), and
+/// gitignore rules (`.gitignore`, `.ignore`, git excludes) apply when `root`
+/// is inside a git repository. Bounded to [`MAX_FILES`].
+pub fn gather_files(root: impl AsRef<Path>) -> FileSnapshot {
+    gather_files_capped(root, MAX_FILES)
+}
+
+/// [`gather_files`] with an explicit cap, so the truncation boundary is
+/// testable without materializing `MAX_FILES` real files.
+fn gather_files_capped(root: impl AsRef<Path>, cap: usize) -> FileSnapshot {
     let root = root.as_ref();
-    let mut out = Vec::new();
-    let walker = WalkDir::new(root)
-        .into_iter()
-        .filter_entry(|e| !is_hidden(e));
-    for entry in walker.flatten() {
-        if out.len() >= MAX_FILES {
-            break;
-        }
-        if entry.file_type().is_file() {
+    let mut items = Vec::new();
+    let mut truncated = false;
+    // Walk errors (unreadable dirs, dangling entries) are skipped, as before.
+    for entry in WalkBuilder::new(root).build().flatten() {
+        if entry.file_type().is_some_and(|t| t.is_file()) {
+            // Only an eligible file *beyond* the cap proves truncation, so a
+            // tree with exactly `cap` files is not falsely flagged.
+            if items.len() >= cap {
+                truncated = true;
+                break;
+            }
             let path = entry.path().to_path_buf();
             let display = path
                 .strip_prefix(root)
                 .unwrap_or(&path)
                 .to_string_lossy()
                 .to_string();
-            out.push(FileItem { path, display });
+            items.push(FileItem { path, display });
         }
     }
-    out
-}
-
-/// Whether `entry` is a hidden (dot-prefixed) file or directory below the root.
-/// Filtering a directory here prunes its whole subtree, so `.git` and friends
-/// never get walked. The root itself (depth 0) is never treated as hidden.
-fn is_hidden(entry: &DirEntry) -> bool {
-    entry.depth() > 0
-        && entry
-            .file_name()
-            .to_str()
-            .is_some_and(|s| s.starts_with('.'))
+    FileSnapshot { items, truncated }
 }
 
 /// Score `candidate` against `query` as a case-insensitive subsequence, or
@@ -206,21 +213,107 @@ mod tests {
         assert_eq!(items[order[0]].display, "x.rs");
     }
 
+    /// A unique temp workspace for a walk test; caller removes it when done.
+    fn temp_root(tag: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!("vybim_ff_{tag}_{}", std::process::id()));
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    fn displays(snapshot: &FileSnapshot) -> Vec<&str> {
+        snapshot.items.iter().map(|f| f.display.as_str()).collect()
+    }
+
     #[test]
     fn gather_files_skips_hidden_dirs() {
-        let root = std::env::temp_dir().join(format!("vybim_ff_{}", std::process::id()));
+        let root = temp_root("hidden");
         std::fs::create_dir_all(root.join(".git")).unwrap();
         std::fs::create_dir_all(root.join("src")).unwrap();
         std::fs::write(root.join("src/main.rs"), "fn main() {}").unwrap();
         std::fs::write(root.join(".git/config"), "x").unwrap();
         std::fs::write(root.join("Cargo.toml"), "y").unwrap();
 
-        let files = gather_files(&root);
-        let displays: Vec<&str> = files.iter().map(|f| f.display.as_str()).collect();
+        let snapshot = gather_files(&root);
+        let displays = displays(&snapshot);
         assert!(displays.contains(&"src/main.rs"));
         assert!(displays.contains(&"Cargo.toml"));
         // nothing from the hidden .git directory
         assert!(!displays.iter().any(|d| d.contains(".git")));
+        assert!(!snapshot.truncated);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn gather_files_respects_gitignore_in_a_git_repo() {
+        let root = temp_root("gitignore");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::create_dir_all(root.join("target/debug")).unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join(".gitignore"), "target/\n").unwrap();
+        std::fs::write(root.join("target/debug/artifact.o"), "junk").unwrap();
+        std::fs::write(root.join("src/main.rs"), "fn main() {}").unwrap();
+        std::fs::write(root.join("Cargo.toml"), "y").unwrap();
+
+        let snapshot = gather_files(&root);
+        let displays = displays(&snapshot);
+        assert!(displays.contains(&"src/main.rs"));
+        assert!(displays.contains(&"Cargo.toml"));
+        assert!(
+            !displays.iter().any(|d| d.contains("target")),
+            "gitignored target/ leaked into the snapshot: {displays:?}"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn ignored_files_do_not_consume_the_snapshot_cap() {
+        let root = temp_root("cap_budget");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::create_dir_all(root.join("junk")).unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join(".gitignore"), "junk/\n").unwrap();
+        // More ignored files than the cap: if they consumed budget, the real
+        // files could never all fit.
+        for i in 0..6 {
+            std::fs::write(root.join(format!("junk/f{i}.o")), "x").unwrap();
+        }
+        std::fs::write(root.join("src/a.rs"), "a").unwrap();
+        std::fs::write(root.join("src/b.rs"), "b").unwrap();
+
+        // Cap of 2 fits exactly the eligible files (a.rs, b.rs — .gitignore
+        // itself is hidden): any ignored file charged against the budget
+        // would evict one of them or flag truncation.
+        let snapshot = gather_files_capped(&root, 2);
+        let displays = displays(&snapshot);
+        assert!(displays.contains(&"src/a.rs"));
+        assert!(displays.contains(&"src/b.rs"));
+        assert!(!displays.iter().any(|d| d.contains("junk")));
+        assert!(!snapshot.truncated);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn walk_beyond_the_cap_reports_truncation() {
+        let root = temp_root("truncated");
+        for i in 0..4 {
+            std::fs::write(root.join(format!("f{i}.rs")), "x").unwrap();
+        }
+        let snapshot = gather_files_capped(&root, 3);
+        assert_eq!(snapshot.items.len(), 3);
+        assert!(snapshot.truncated);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn walk_exactly_at_the_cap_is_not_truncated() {
+        let root = temp_root("at_cap");
+        for i in 0..3 {
+            std::fs::write(root.join(format!("f{i}.rs")), "x").unwrap();
+        }
+        let snapshot = gather_files_capped(&root, 3);
+        assert_eq!(snapshot.items.len(), 3);
+        assert!(!snapshot.truncated);
         std::fs::remove_dir_all(&root).ok();
     }
 }

@@ -336,17 +336,21 @@ struct FileFinder {
     items: Vec<FileItem>,
     matches: Vec<usize>,
     selected: usize,
+    /// Whether the snapshot walk was cut short by the file cap, so the results
+    /// list is knowingly incomplete.
+    truncated: bool,
 }
 
 impl FileFinder {
     /// Snapshot `root`'s files and seed the (empty-query) match list.
     fn open(root: &Path) -> Self {
-        let items = file_find::gather_files(root);
-        let matches = file_find::rank(&items, "");
+        let snapshot = file_find::gather_files(root);
+        let matches = file_find::rank(&snapshot.items, "");
         Self {
-            items,
+            items: snapshot.items,
             matches,
             selected: 0,
+            truncated: snapshot.truncated,
         }
     }
 
@@ -1544,11 +1548,17 @@ fn render_file_finder_results(frame: &mut Frame, prompt_row: Rect, ff: &FileFind
         .map(|(row, &item_idx)| (start + row, ff.items[item_idx].display.as_str()))
         .collect();
 
+    // An incomplete snapshot is announced in the block's border title, which
+    // costs no result rows but must fit inside the popup's width.
+    let title = ff
+        .truncated
+        .then(|| format!(" results truncated at {} files ", file_find::MAX_FILES));
     let longest = window
         .iter()
         .map(|(_, d)| d.chars().count())
         .max()
-        .unwrap_or(0);
+        .unwrap_or(0)
+        .max(title.as_deref().map_or(0, |t| t.chars().count()));
     let w = ((longest as u16).saturating_add(2))
         .min(screen.width)
         .max(1);
@@ -1568,7 +1578,10 @@ fn render_file_finder_results(frame: &mut Frame, prompt_row: Rect, ff: &FileFind
         })
         .collect();
 
-    let block = theme.block(Borders::ALL);
+    let mut block = theme.block(Borders::ALL);
+    if let Some(title) = title {
+        block = block.title(Line::styled(title, Style::new().fg(theme.inactive_fg)));
+    }
     let area = Rect::new(x, y, w, h);
     frame.render_widget(Clear, area);
     frame.render_widget(Paragraph::new(Text::from(lines)).block(block), area);
@@ -2169,6 +2182,40 @@ mod tests {
         app.on_key(press(KeyCode::Enter, KeyModifiers::NONE));
         assert_eq!(app.buffers.len(), before);
         assert_eq!(app.focus, Focus::Editor);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Render `app` into an in-memory terminal and return the screen text,
+    /// one line per row.
+    fn render_to_string(app: &mut App, width: u16, height: u16) -> String {
+        let backend = ratatui::backend::TestBackend::new(width, height);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let mut out = String::new();
+        for y in 0..buffer.area.height {
+            for x in 0..buffer.area.width {
+                out.push_str(buffer[(x, y)].symbol());
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    #[test]
+    fn truncated_snapshot_shows_indicator_and_complete_does_not() {
+        let (mut app, dir) = fixture_app("truncated_title");
+        app.on_key(press(KeyCode::Char('p'), KeyModifiers::CONTROL));
+        // the fixture is tiny, so the snapshot is complete: no indicator
+        let screen = render_to_string(&mut app, 80, 24);
+        assert!(!screen.contains("results truncated"));
+        // force the truncated state the cap would produce on a huge tree
+        app.file_finder.as_mut().unwrap().truncated = true;
+        let screen = render_to_string(&mut app, 80, 24);
+        assert!(
+            screen.contains("results truncated at 10000 files"),
+            "missing truncation title in:\n{screen}"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
