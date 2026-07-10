@@ -426,6 +426,10 @@ pub struct App {
     lsp: Lsp,
     /// Last time a `didChange` was sent, for throttling document sync.
     last_lsp_sync: Option<Instant>,
+    /// Buffer with edits still unsent to its language server: set when the
+    /// throttle withholds a `didChange`, cleared by the flush that follows
+    /// (a run-loop wakeup, or forced before a position-based request).
+    lsp_pending_sync: Option<usize>,
 }
 
 impl App {
@@ -455,6 +459,7 @@ impl App {
             jumps: JumpList::new(),
             lsp: Lsp::new(),
             last_lsp_sync: None,
+            lsp_pending_sync: None,
         }
     }
 
@@ -490,15 +495,29 @@ impl App {
         while !self.should_quit {
             terminal.draw(|frame| self.render(frame))?;
 
-            match rx.recv() {
-                Ok(ev) => self.handle_app_event(ev),
-                Err(_) => break,
+            // Block for the next event — but while a throttled `didChange` is
+            // pending, wake in time to flush it even if the user stops typing.
+            let ev = if self.lsp_pending_sync.is_some() {
+                match rx.recv_timeout(LSP_SYNC_INTERVAL) {
+                    Ok(ev) => Some(ev),
+                    Err(mpsc::RecvTimeoutError::Timeout) => None,
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                }
+            } else {
+                match rx.recv() {
+                    Ok(ev) => Some(ev),
+                    Err(_) => break,
+                }
+            };
+            if let Some(ev) = ev {
+                self.handle_app_event(ev);
             }
             // Coalesce any already-queued events (e.g. bursty shell output)
             // before the next redraw.
             while let Ok(ev) = rx.try_recv() {
                 self.handle_app_event(ev);
             }
+            self.lsp_flush_pending_sync();
         }
         // Cleanly stop every language server before leaving.
         self.lsp.shutdown_all();
@@ -932,24 +951,56 @@ impl App {
     }
 
     /// Notify the LSP client of an edit, throttled to at most one full-document
-    /// sync per [`LSP_SYNC_INTERVAL`]. Inert unless the event loop is running.
+    /// sync per [`LSP_SYNC_INTERVAL`]. A withheld edit is remembered in
+    /// `lsp_pending_sync` and flushed by the run loop once the interval
+    /// elapses, so the server never stays stale after a burst of typing.
+    /// Inert unless the event loop is running.
     fn lsp_did_change(&mut self) {
         if self.event_tx.is_none() {
             return;
         }
-        let now = Instant::now();
-        if let Some(last) = self.last_lsp_sync
-            && now.duration_since(last) < LSP_SYNC_INTERVAL
+        let id = self.panes[self.focused].buffer_id;
+        // An edit in a different document than the pending one: flush the
+        // pending sync now — the throttle coalesces keystrokes within one
+        // document, not across documents.
+        if let Some(pending) = self.lsp_pending_sync
+            && pending != id
         {
+            self.lsp_sync_buffer(pending);
+        }
+        if let Some(last) = self.last_lsp_sync
+            && last.elapsed() < LSP_SYNC_INTERVAL
+        {
+            self.lsp_pending_sync = Some(id);
             return;
         }
-        let ed = &self.panes[self.focused];
-        let Some(path) = self.buffers[ed.buffer_id].path().map(Path::to_path_buf) else {
+        self.lsp_sync_buffer(id);
+    }
+
+    /// Send buffer `id`'s full text as a `didChange` now, bypassing the
+    /// throttle, and clear the pending sync it satisfies.
+    fn lsp_sync_buffer(&mut self, id: usize) {
+        if self.lsp_pending_sync == Some(id) {
+            self.lsp_pending_sync = None;
+        }
+        let Some(path) = self.buffers[id].path().map(Path::to_path_buf) else {
             return;
         };
-        self.last_lsp_sync = Some(now);
-        let text = self.buffers[ed.buffer_id].text();
+        self.last_lsp_sync = Some(Instant::now());
+        let text = self.buffers[id].text();
         self.lsp.notify_changed(&path, &text);
+    }
+
+    /// Flush a throttled `didChange` whose interval has elapsed. Called by the
+    /// run loop after every wakeup.
+    fn lsp_flush_pending_sync(&mut self) {
+        if let Some(id) = self.lsp_pending_sync
+            && self
+                .last_lsp_sync
+                .is_none_or(|last| last.elapsed() >= LSP_SYNC_INTERVAL)
+        {
+            self.lsp_sync_buffer(id);
+        }
     }
 
     // --- go to definition --------------------------------------------------
@@ -957,6 +1008,11 @@ impl App {
     /// `F12`: ask the focused buffer's language server for the definition at the
     /// cursor. A quiet no-op when no definition-capable server is running.
     fn goto_definition(&mut self) {
+        // The position must be computed against the text the user sees: flush
+        // any edit the throttle is still holding back before asking.
+        if let Some(id) = self.lsp_pending_sync {
+            self.lsp_sync_buffer(id);
+        }
         let ed = &self.panes[self.focused];
         let buffer = &self.buffers[ed.buffer_id];
         let Some(path) = buffer.path().map(Path::to_path_buf) else {
@@ -2413,6 +2469,21 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// The full-document texts of every `didChange` the client sent, in order.
+    fn didchange_texts(sink: &crate::lsp::transport::TestSink) -> Vec<String> {
+        Lsp::sent_messages(sink)
+            .into_iter()
+            .filter_map(|m| match m {
+                crate::lsp::Message::Notification { method, params, .. }
+                    if method == "textDocument/didChange" =>
+                {
+                    Some(params["contentChanges"][0]["text"].as_str()?.to_string())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
     #[test]
     fn reopening_a_file_reuses_its_buffer() {
         let (mut app, dir, _alpha, bravo) = jump_fixture("reuse_open");
@@ -2438,6 +2509,60 @@ mod tests {
         assert_eq!(app.buffers.len(), 2);
         let text = app.buffers[app.panes[app.focused].buffer_id].text();
         assert!(text.starts_with('x'));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_throttled_edit_is_flushed_before_a_definition_request() {
+        let (mut app, dir, alpha, _bravo) = jump_fixture("gd_flush");
+        let _rx = with_terminals(&mut app);
+        let (_id, sink) = app
+            .lsp
+            .install_test_server("rust", serde_json::json!({ "definitionProvider": true }));
+        app.lsp_did_open(&alpha);
+
+        // The first keystroke syncs immediately; the second lands inside the
+        // throttle window (pinned, so a slow test runner can't widen it) and
+        // is withheld as pending.
+        app.on_key(press(KeyCode::Char('x'), KeyModifiers::NONE));
+        app.last_lsp_sync = Some(Instant::now());
+        app.on_key(press(KeyCode::Char('y'), KeyModifiers::NONE));
+        assert_eq!(didchange_texts(&sink).len(), 1);
+        assert!(app.lsp_pending_sync.is_some());
+
+        // F12 flushes the withheld edit before issuing the request, so the
+        // server resolves the position against the text as typed.
+        app.on_key(press(KeyCode::F(12), KeyModifiers::NONE));
+        let changes = didchange_texts(&sink);
+        assert_eq!(changes.len(), 2);
+        assert!(changes[1].starts_with("xy"));
+        assert!(app.lsp_pending_sync.is_none());
+        assert_eq!(definition_request_positions(&sink).len(), 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn pending_sync_flushes_once_the_interval_elapses() {
+        let (mut app, dir, alpha, _bravo) = jump_fixture("sync_flush");
+        let _rx = with_terminals(&mut app);
+        let (_id, sink) = app.lsp.install_test_server("rust", serde_json::json!({}));
+        app.lsp_did_open(&alpha);
+
+        app.on_key(press(KeyCode::Char('x'), KeyModifiers::NONE));
+        app.last_lsp_sync = Some(Instant::now());
+        app.on_key(press(KeyCode::Char('y'), KeyModifiers::NONE));
+        assert_eq!(didchange_texts(&sink).len(), 1);
+
+        // Inside the interval the flush is a no-op; once it elapses (simulated
+        // by backdating the last sync) the trailing edit goes out.
+        app.lsp_flush_pending_sync();
+        assert_eq!(didchange_texts(&sink).len(), 1);
+        app.last_lsp_sync = Some(Instant::now() - LSP_SYNC_INTERVAL);
+        app.lsp_flush_pending_sync();
+        let changes = didchange_texts(&sink);
+        assert_eq!(changes.len(), 2);
+        assert!(changes[1].starts_with("xy"));
+        assert!(app.lsp_pending_sync.is_none());
         std::fs::remove_dir_all(&dir).ok();
     }
 
