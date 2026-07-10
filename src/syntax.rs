@@ -54,26 +54,34 @@ impl std::fmt::Debug for Syntax {
 }
 
 impl Syntax {
-    /// Build a highlighter for a file, based on its extension, or `None` if no
-    /// grammar is bundled for it.
+    /// Build a highlighter for a file, or `None` if no grammar is bundled for
+    /// it. Extension→language resolution is delegated to the LSP registry's
+    /// [`language_of`](crate::lsp::registry::language_of) — the single map —
+    /// so the highlighter and the language servers can't drift apart.
     pub fn for_path(path: &Path) -> Option<Syntax> {
-        match path.extension()?.to_str()? {
-            "rs" => Some(Self::grammar(
+        Self::for_language(crate::lsp::registry::language_of(path)?)
+    }
+
+    /// A highlighter for a language key, or `None` when no grammar is bundled
+    /// (the registry knows languages we serve via LSP but don't highlight).
+    fn for_language(language: &str) -> Option<Syntax> {
+        match language {
+            "rust" => Some(Self::grammar(
                 tree_sitter_rust::LANGUAGE.into(),
                 "rust",
                 tree_sitter_rust::HIGHLIGHTS_QUERY,
             )),
-            "c" | "h" => Some(Self::grammar(
+            "c" => Some(Self::grammar(
                 tree_sitter_c::LANGUAGE.into(),
                 "c",
                 tree_sitter_c::HIGHLIGHT_QUERY,
             )),
-            "py" | "pyi" => Some(Self::grammar(
+            "python" => Some(Self::grammar(
                 tree_sitter_python::LANGUAGE.into(),
                 "python",
                 tree_sitter_python::HIGHLIGHTS_QUERY,
             )),
-            "cpp" | "cc" | "cxx" | "hpp" => Some(Self::grammar(
+            "cpp" => Some(Self::grammar(
                 tree_sitter_cpp::LANGUAGE.into(),
                 "cpp",
                 tree_sitter_cpp::HIGHLIGHT_QUERY,
@@ -169,6 +177,14 @@ mod tests {
     #[test]
     fn rust_files_get_a_grammar() {
         assert!(Syntax::for_path(Path::new("main.rs")).is_some());
+    }
+
+    #[test]
+    fn registry_languages_without_a_bundled_grammar_have_none() {
+        // The registry maps these for LSP, but no grammar is bundled: the
+        // shared extension→language map must not invent a highlighter.
+        assert!(Syntax::for_path(Path::new("app.ts")).is_none());
+        assert!(Syntax::for_path(Path::new("main.go")).is_none());
     }
 
     #[test]

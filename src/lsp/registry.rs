@@ -1,7 +1,8 @@
 //! The only language-specific surface of the LSP client: a map from a file's
-//! language (resolved by extension, mirroring `Syntax::for_path`) to the
-//! command that launches its server. Built-in defaults, overridable by a user
-//! config file. Adding a language is data, not code.
+//! language (resolved by extension via [`language_of`], the crate's single
+//! extension→language map — the syntax highlighter dispatches on it too) to
+//! the command that launches its server. Built-in defaults, overridable by a
+//! user config file. Adding a language is data, not code.
 
 use std::path::Path;
 
@@ -24,8 +25,9 @@ impl ServerCmd {
     }
 }
 
-/// The language key for a path, by extension — the same dispatch shape the
-/// syntax highlighter uses. `None` for extensions we don't map.
+/// The language key for a path, by extension — the crate's single
+/// extension→language map, shared by the LSP client and the syntax
+/// highlighter. `None` for extensions we don't map.
 pub fn language_of(path: &Path) -> Option<&'static str> {
     Some(match path.extension()?.to_str()? {
         "rs" => "rust",
